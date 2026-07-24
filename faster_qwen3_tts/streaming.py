@@ -59,12 +59,12 @@ def fast_generate_streaming(
     fused_codec_weights, fused_codec_offsets = get_fused_codec_embeddings(predictor)
 
     # === PREFILL (still uses HF forward for variable-length prefill) ===
-    t_start = time.time()
+    t_start = time.perf_counter()
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
     prefill_events.record("start")
 
-    forward_started = time.time()
+    forward_started = time.perf_counter()
     out = talker.forward(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
@@ -78,7 +78,7 @@ def fast_generate_streaming(
         past_key_values=None,
     )
     prefill_profile["talker_forward_launch_wall_ms"] = (
-        time.time() - forward_started
+        time.perf_counter() - forward_started
     ) * 1000
     prefill_events.record("after_forward")
 
@@ -86,7 +86,7 @@ def fast_generate_streaming(
     past_hidden = out.past_hidden
     gen_step = out.generation_step
 
-    sample_started = time.time()
+    sample_started = time.perf_counter()
     logits = out.logits[:, -1, :]
     suppress_eos = min_new_tokens > 0
     token = sample_logits(
@@ -99,22 +99,22 @@ def fast_generate_streaming(
         suppress_tokens=eos_suppress_ids if suppress_eos else None,
     )
     prefill_profile["first_sample_launch_wall_ms"] = (
-        time.time() - sample_started
+        time.perf_counter() - sample_started
     ) * 1000
     prefill_events.record("after_sample")
 
-    prefill_kv_started = time.time()
+    prefill_kv_started = time.perf_counter()
     prefill_len = talker_graph.prefill_kv(talker_past_kv)
     prefill_profile["prefill_kv_launch_wall_ms"] = (
-        time.time() - prefill_kv_started
+        time.perf_counter() - prefill_kv_started
     ) * 1000
     prefill_events.record("after_prefill_kv")
 
-    generation_state_started = time.time()
+    generation_state_started = time.perf_counter()
     rope_deltas = getattr(talker, "rope_deltas", None)
     talker_graph.set_generation_state(attention_mask, rope_deltas)
     prefill_profile["generation_state_wall_ms"] = (
-        time.time() - generation_state_started
+        time.perf_counter() - generation_state_started
     ) * 1000
     prefill_events.record("after_generation_state")
 
@@ -128,11 +128,15 @@ def fast_generate_streaming(
     token_events[0].record()
     prefill_events.record("before_sync")
 
-    sync_started = time.time()
+    sync_started = time.perf_counter()
     torch.cuda.synchronize()
-    prefill_profile["prefill_sync_wait_ms"] = (time.time() - sync_started) * 1000
-    t_prefill = time.time() - t_start
-    prefill_profile.update(prefill_events.elapsed_ms())
+    prefill_profile["prefill_sync_wait_ms"] = (
+        time.perf_counter() - sync_started
+    ) * 1000
+    t_prefill = time.perf_counter() - t_start
+    prefill_profile.update(
+        _finalize_prefill_profile(prefill_events.elapsed_ms(), profile_prefill)
+    )
 
     # === DECODE LOOP — yield chunks ===
     chunk_buffer = []
@@ -291,18 +295,22 @@ class _PrefillEvents:
     def __init__(self, device, enabled: bool):
         self._enabled = enabled and device.type == "cuda"
         self._events = {}
+        self._stream_ids = {}
 
     def record(self, name: str) -> None:
         if not self._enabled:
             return
+        stream = torch.cuda.current_stream()
         event = torch.cuda.Event(enable_timing=True)
-        event.record()
+        event.record(stream)
         self._events[name] = event
+        self._stream_ids[name] = int(stream.cuda_stream)
 
     def elapsed_ms(self) -> dict:
         if not self._enabled:
             return {}
         return {
+            "prefill_total_gpu_ms": self._elapsed("start", "before_sync"),
             "talker_forward_gpu_ms": self._elapsed("start", "after_forward"),
             "first_sample_gpu_ms": self._elapsed("after_forward", "after_sample"),
             "prefill_kv_gpu_ms": self._elapsed("after_sample", "after_prefill_kv"),
@@ -314,14 +322,61 @@ class _PrefillEvents:
                 "after_generation_state",
                 "before_sync",
             ),
+            "prefill_total_gpu_stream_id": self._stream_id("start"),
+            "talker_forward_gpu_stream_id": self._stream_id("start"),
+            "first_sample_gpu_stream_id": self._stream_id("after_forward"),
+            "prefill_kv_gpu_stream_id": self._stream_id("after_sample"),
+            "generation_state_gpu_stream_id": self._stream_id("after_prefill_kv"),
+            "prefill_to_sync_gpu_stream_id": self._stream_id(
+                "after_generation_state"
+            ),
         }
 
-    def _elapsed(self, start_name: str, end_name: str) -> float:
+    def _elapsed(self, start_name: str, end_name: str) -> float | None:
         start = self._events.get(start_name)
         end = self._events.get(end_name)
         if start is None or end is None:
-            return 0.0
+            return None
         return float(start.elapsed_time(end))
+
+    def _stream_id(self, name: str) -> int | None:
+        return self._stream_ids.get(name)
+
+
+def _finalize_prefill_profile(event_profile: dict, profile_prefill: bool) -> dict:
+    profile = {
+        "profile_schema_version": 2,
+        "profile_prefill_enabled": bool(profile_prefill),
+    }
+    profile.update(event_profile)
+
+    component_keys = (
+        "talker_forward_gpu_ms",
+        "first_sample_gpu_ms",
+        "prefill_kv_gpu_ms",
+        "generation_state_gpu_ms",
+        "prefill_to_sync_gpu_ms",
+    )
+    component_values = [profile.get(key) for key in component_keys]
+    components_complete = all(
+        isinstance(value, (int, float)) for value in component_values
+    )
+    total = profile.get("prefill_total_gpu_ms")
+    if components_complete:
+        component_sum = float(sum(component_values))
+        profile["prefill_gpu_component_sum_ms"] = component_sum
+        profile["prefill_gpu_accounting_error_ms"] = (
+            float(total) - component_sum if isinstance(total, (int, float)) else None
+        )
+    else:
+        profile["prefill_gpu_component_sum_ms"] = None
+        profile["prefill_gpu_accounting_error_ms"] = None
+
+    required_keys = ("prefill_total_gpu_ms", *component_keys)
+    profile["profile_complete"] = all(
+        isinstance(profile.get(key), (int, float)) for key in required_keys
+    )
+    return profile
 
 
 def _chunk_timing(
@@ -373,12 +428,12 @@ def parity_generate_streaming(
     eos_suppress_ids = torch.tensor([eos_id], dtype=torch.long, device=device)
 
     # === PREFILL ===
-    t_start = time.time()
+    t_start = time.perf_counter()
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
     prefill_events.record("start")
 
-    forward_started = time.time()
+    forward_started = time.perf_counter()
     out = talker.forward(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
@@ -392,7 +447,7 @@ def parity_generate_streaming(
         past_key_values=None,
     )
     prefill_profile["talker_forward_launch_wall_ms"] = (
-        time.time() - forward_started
+        time.perf_counter() - forward_started
     ) * 1000
     prefill_events.record("after_forward")
 
@@ -400,7 +455,7 @@ def parity_generate_streaming(
     past_hidden = out.past_hidden
     gen_step = out.generation_step
 
-    sample_started = time.time()
+    sample_started = time.perf_counter()
     logits = out.logits[:, -1, :]
     suppress_eos = min_new_tokens > 0
     token = sample_logits(
@@ -413,23 +468,27 @@ def parity_generate_streaming(
         suppress_tokens=eos_suppress_ids if suppress_eos else None,
     )
     prefill_profile["first_sample_launch_wall_ms"] = (
-        time.time() - sample_started
+        time.perf_counter() - sample_started
     ) * 1000
     prefill_events.record("after_sample")
 
-    generation_state_started = time.time()
+    generation_state_started = time.perf_counter()
     if attention_mask is not None:
         attention_mask = attention_mask.clone()
     prefill_profile["generation_state_wall_ms"] = (
-        time.time() - generation_state_started
+        time.perf_counter() - generation_state_started
     ) * 1000
     prefill_events.record("after_generation_state")
 
-    sync_started = time.time()
+    sync_started = time.perf_counter()
     torch.cuda.synchronize()
-    prefill_profile["prefill_sync_wait_ms"] = (time.time() - sync_started) * 1000
-    t_prefill = time.time() - t_start
-    prefill_profile.update(prefill_events.elapsed_ms())
+    prefill_profile["prefill_sync_wait_ms"] = (
+        time.perf_counter() - sync_started
+    ) * 1000
+    t_prefill = time.perf_counter() - t_start
+    prefill_profile.update(
+        _finalize_prefill_profile(prefill_events.elapsed_ms(), profile_prefill)
+    )
 
     # === DECODE LOOP — yield chunks ===
     chunk_buffer = []

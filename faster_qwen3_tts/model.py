@@ -571,7 +571,7 @@ class FasterQwen3TTS:
         non_streaming_mode: bool = True,
         return_metadata: bool = False,
     ):
-        tokenize_started = time.time()
+        tokenize_started = time.perf_counter()
         input_texts = [self.model._build_assistant_text(text)]
         input_ids = self.model._tokenize_texts(input_texts)
 
@@ -584,10 +584,10 @@ class FasterQwen3TTS:
                     0
                 ]
             )
-        tokenize_wall_ms = (time.time() - tokenize_started) * 1000
+        tokenize_wall_ms = (time.perf_counter() - tokenize_started) * 1000
 
         m = self.model.model
-        build_started = time.time()
+        build_started = time.perf_counter()
         tie, tam, tth, tpe = self._build_talker_inputs_local(
             m=m,
             input_ids=input_ids,
@@ -598,7 +598,7 @@ class FasterQwen3TTS:
             non_streaming_mode=non_streaming_mode,
             instruct_ids=instruct_ids,
         )
-        build_talker_inputs_wall_ms = (time.time() - build_started) * 1000
+        build_talker_inputs_wall_ms = (time.perf_counter() - build_started) * 1000
 
         if not self._warmed_up:
             self.warmup(tie.shape[1])
