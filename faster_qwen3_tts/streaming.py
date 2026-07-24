@@ -18,6 +18,22 @@ from .sampling import apply_repetition_penalty, build_suppress_mask, sample_logi
 from .talker_graph import TalkerGraph
 
 
+class _CudaNvtxRange:
+    def __init__(self, name: str, enabled: bool):
+        self._name = name
+        self._enabled = enabled
+
+    def __enter__(self):
+        if self._enabled:
+            torch.cuda.nvtx.range_push(self._name)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._enabled:
+            torch.cuda.nvtx.range_pop()
+        return False
+
+
 @torch.inference_mode()
 def fast_generate_streaming(
     talker,
@@ -62,21 +78,23 @@ def fast_generate_streaming(
     t_start = time.perf_counter()
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
+    nvtx_enabled = profile_prefill and device.type == "cuda"
     prefill_events.record("start")
 
     forward_started = time.perf_counter()
-    out = talker.forward(
-        inputs_embeds=talker_input_embeds,
-        attention_mask=attention_mask,
-        use_cache=True,
-        output_hidden_states=True,
-        return_dict=True,
-        trailing_text_hidden=trailing_text_hiddens,
-        tts_pad_embed=tts_pad_embed,
-        generation_step=None,
-        past_hidden=None,
-        past_key_values=None,
-    )
+    with _CudaNvtxRange("qtb_prefill_talker_forward", nvtx_enabled):
+        out = talker.forward(
+            inputs_embeds=talker_input_embeds,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            trailing_text_hidden=trailing_text_hiddens,
+            tts_pad_embed=tts_pad_embed,
+            generation_step=None,
+            past_hidden=None,
+            past_key_values=None,
+        )
     prefill_profile["talker_forward_launch_wall_ms"] = (
         time.perf_counter() - forward_started
     ) * 1000
@@ -87,32 +105,35 @@ def fast_generate_streaming(
     gen_step = out.generation_step
 
     sample_started = time.perf_counter()
-    logits = out.logits[:, -1, :]
-    suppress_eos = min_new_tokens > 0
-    token = sample_logits(
-        logits,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        do_sample=do_sample,
-        suppress_mask=suppress_mask,
-        suppress_tokens=eos_suppress_ids if suppress_eos else None,
-    )
+    with _CudaNvtxRange("qtb_prefill_first_sample", nvtx_enabled):
+        logits = out.logits[:, -1, :]
+        suppress_eos = min_new_tokens > 0
+        token = sample_logits(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            suppress_mask=suppress_mask,
+            suppress_tokens=eos_suppress_ids if suppress_eos else None,
+        )
     prefill_profile["first_sample_launch_wall_ms"] = (
         time.perf_counter() - sample_started
     ) * 1000
     prefill_events.record("after_sample")
 
     prefill_kv_started = time.perf_counter()
-    prefill_len = talker_graph.prefill_kv(talker_past_kv)
+    with _CudaNvtxRange("qtb_prefill_static_cache", nvtx_enabled):
+        prefill_len = talker_graph.prefill_kv(talker_past_kv)
     prefill_profile["prefill_kv_launch_wall_ms"] = (
         time.perf_counter() - prefill_kv_started
     ) * 1000
     prefill_events.record("after_prefill_kv")
 
     generation_state_started = time.perf_counter()
-    rope_deltas = getattr(talker, "rope_deltas", None)
-    talker_graph.set_generation_state(attention_mask, rope_deltas)
+    with _CudaNvtxRange("qtb_prefill_generation_state", nvtx_enabled):
+        rope_deltas = getattr(talker, "rope_deltas", None)
+        talker_graph.set_generation_state(attention_mask, rope_deltas)
     prefill_profile["generation_state_wall_ms"] = (
         time.perf_counter() - generation_state_started
     ) * 1000
@@ -129,7 +150,8 @@ def fast_generate_streaming(
     prefill_events.record("before_sync")
 
     sync_started = time.perf_counter()
-    torch.cuda.synchronize()
+    with _CudaNvtxRange("qtb_prefill_final_sync", nvtx_enabled):
+        torch.cuda.synchronize()
     prefill_profile["prefill_sync_wait_ms"] = (
         time.perf_counter() - sync_started
     ) * 1000
@@ -431,21 +453,23 @@ def parity_generate_streaming(
     t_start = time.perf_counter()
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
+    nvtx_enabled = profile_prefill and device.type == "cuda"
     prefill_events.record("start")
 
     forward_started = time.perf_counter()
-    out = talker.forward(
-        inputs_embeds=talker_input_embeds,
-        attention_mask=attention_mask,
-        use_cache=True,
-        output_hidden_states=True,
-        return_dict=True,
-        trailing_text_hidden=trailing_text_hiddens,
-        tts_pad_embed=tts_pad_embed,
-        generation_step=None,
-        past_hidden=None,
-        past_key_values=None,
-    )
+    with _CudaNvtxRange("qtb_prefill_talker_forward", nvtx_enabled):
+        out = talker.forward(
+            inputs_embeds=talker_input_embeds,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            trailing_text_hidden=trailing_text_hiddens,
+            tts_pad_embed=tts_pad_embed,
+            generation_step=None,
+            past_hidden=None,
+            past_key_values=None,
+        )
     prefill_profile["talker_forward_launch_wall_ms"] = (
         time.perf_counter() - forward_started
     ) * 1000
@@ -456,32 +480,35 @@ def parity_generate_streaming(
     gen_step = out.generation_step
 
     sample_started = time.perf_counter()
-    logits = out.logits[:, -1, :]
-    suppress_eos = min_new_tokens > 0
-    token = sample_logits(
-        logits,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        do_sample=do_sample,
-        suppress_mask=suppress_mask,
-        suppress_tokens=eos_suppress_ids if suppress_eos else None,
-    )
+    with _CudaNvtxRange("qtb_prefill_first_sample", nvtx_enabled):
+        logits = out.logits[:, -1, :]
+        suppress_eos = min_new_tokens > 0
+        token = sample_logits(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            suppress_mask=suppress_mask,
+            suppress_tokens=eos_suppress_ids if suppress_eos else None,
+        )
     prefill_profile["first_sample_launch_wall_ms"] = (
         time.perf_counter() - sample_started
     ) * 1000
     prefill_events.record("after_sample")
 
     generation_state_started = time.perf_counter()
-    if attention_mask is not None:
-        attention_mask = attention_mask.clone()
+    with _CudaNvtxRange("qtb_prefill_generation_state", nvtx_enabled):
+        if attention_mask is not None:
+            attention_mask = attention_mask.clone()
     prefill_profile["generation_state_wall_ms"] = (
         time.perf_counter() - generation_state_started
     ) * 1000
     prefill_events.record("after_generation_state")
 
     sync_started = time.perf_counter()
-    torch.cuda.synchronize()
+    with _CudaNvtxRange("qtb_prefill_final_sync", nvtx_enabled):
+        torch.cuda.synchronize()
     prefill_profile["prefill_sync_wait_ms"] = (
         time.perf_counter() - sync_started
     ) * 1000
