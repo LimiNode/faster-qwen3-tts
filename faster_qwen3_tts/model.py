@@ -1349,6 +1349,7 @@ class FasterQwen3TTS:
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
         profile_prefill: bool = False,
+        profile_request_role: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "custom_voice":
             raise ValueError("Loaded model does not support custom voice generation")
@@ -1376,6 +1377,8 @@ class FasterQwen3TTS:
                 return_metadata=True,
             )
         )
+        if profile_request_role:
+            input_metadata["profile_request_role"] = profile_request_role
 
         speech_tokenizer = m.speech_tokenizer
 
@@ -1544,6 +1547,7 @@ class FasterQwen3TTS:
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
         profile_prefill: bool = False,
+        profile_request_role: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "voice_design":
             raise ValueError("Loaded model does not support voice design generation")
@@ -1567,6 +1571,8 @@ class FasterQwen3TTS:
                 return_metadata=True,
             )
         )
+        if profile_request_role:
+            input_metadata["profile_request_role"] = profile_request_role
 
         speech_tokenizer = m.speech_tokenizer
 

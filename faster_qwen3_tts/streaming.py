@@ -6,6 +6,7 @@ Yields codec ID chunks during generation instead of collecting all at once.
 CUDA graph usage is identical to non-streaming — same per-step performance.
 """
 
+import math
 import time
 from typing import Generator, Optional, Tuple
 
@@ -79,7 +80,13 @@ def fast_generate_streaming(
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
     nvtx_enabled = profile_prefill and device.type == "cuda"
+    outer_nvtx_name = _profile_outer_nvtx_name(input_metadata)
     prefill_events.record("start")
+    outer_nvtx_range = _CudaNvtxRange(
+        outer_nvtx_name,
+        nvtx_enabled and outer_nvtx_name is not None,
+    )
+    outer_nvtx_range.__enter__()
 
     forward_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_talker_forward", nvtx_enabled):
@@ -152,12 +159,17 @@ def fast_generate_streaming(
     sync_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_final_sync", nvtx_enabled):
         torch.cuda.synchronize()
+    outer_nvtx_range.__exit__(None, None, None)
     prefill_profile["prefill_sync_wait_ms"] = (
         time.perf_counter() - sync_started
     ) * 1000
     t_prefill = time.perf_counter() - t_start
     prefill_profile.update(
-        _finalize_prefill_profile(prefill_events.elapsed_ms(), profile_prefill)
+        _finalize_prefill_profile(
+            prefill_events.elapsed_ms(profile_path="fast"),
+            profile_prefill,
+            profile_path="fast",
+        )
     )
 
     # === DECODE LOOP — yield chunks ===
@@ -313,6 +325,17 @@ def fast_generate_streaming(
         )
 
 
+def _profile_outer_nvtx_name(input_metadata: Optional[dict]) -> Optional[str]:
+    if not input_metadata:
+        return None
+    request_role = input_metadata.get("profile_request_role")
+    if request_role == "first_user":
+        return "qtb_profile_first_user_request"
+    if request_role == "steady":
+        return "qtb_profile_steady_request"
+    return None
+
+
 class _PrefillEvents:
     def __init__(self, device, enabled: bool):
         self._enabled = enabled and device.type == "cuda"
@@ -328,31 +351,56 @@ class _PrefillEvents:
         self._events[name] = event
         self._stream_ids[name] = int(stream.cuda_stream)
 
-    def elapsed_ms(self) -> dict:
+    def elapsed_ms(self, *, profile_path: str) -> dict:
         if not self._enabled:
             return {}
-        return {
+        event_profile = {
             "prefill_total_gpu_ms": self._elapsed("start", "before_sync"),
             "talker_forward_gpu_ms": self._elapsed("start", "after_forward"),
             "first_sample_gpu_ms": self._elapsed("after_forward", "after_sample"),
-            "prefill_kv_gpu_ms": self._elapsed("after_sample", "after_prefill_kv"),
-            "generation_state_gpu_ms": self._elapsed(
-                "after_prefill_kv",
-                "after_generation_state",
-            ),
-            "prefill_to_sync_gpu_ms": self._elapsed(
-                "after_generation_state",
-                "before_sync",
-            ),
             "prefill_total_gpu_stream_id": self._stream_id("start"),
             "talker_forward_gpu_stream_id": self._stream_id("start"),
             "first_sample_gpu_stream_id": self._stream_id("after_forward"),
-            "prefill_kv_gpu_stream_id": self._stream_id("after_sample"),
-            "generation_state_gpu_stream_id": self._stream_id("after_prefill_kv"),
+            "generation_state_gpu_stream_id": self._stream_id("after_sample"),
             "prefill_to_sync_gpu_stream_id": self._stream_id(
                 "after_generation_state"
             ),
         }
+        if profile_path == "fast":
+            event_profile.update(
+                {
+                    "prefill_kv_gpu_ms": self._elapsed(
+                        "after_sample",
+                        "after_prefill_kv",
+                    ),
+                    "generation_state_gpu_ms": self._elapsed(
+                        "after_prefill_kv",
+                        "after_generation_state",
+                    ),
+                    "prefill_kv_gpu_stream_id": self._stream_id("after_sample"),
+                    "generation_state_gpu_stream_id": self._stream_id(
+                        "after_prefill_kv"
+                    ),
+                }
+            )
+        else:
+            event_profile.update(
+                {
+                    "prefill_kv_gpu_ms": None,
+                    "prefill_kv_gpu_stream_id": None,
+                    "generation_state_gpu_ms": self._elapsed(
+                        "after_sample",
+                        "after_generation_state",
+                    ),
+                }
+            )
+        event_profile["prefill_to_sync_gpu_ms"] = self._elapsed(
+            "after_generation_state",
+            "before_sync",
+        )
+        for name in self._events:
+            event_profile[f"{name}_event_recorded"] = True
+        return event_profile
 
     def _elapsed(self, start_name: str, end_name: str) -> float | None:
         start = self._events.get(start_name)
@@ -365,38 +413,133 @@ class _PrefillEvents:
         return self._stream_ids.get(name)
 
 
-def _finalize_prefill_profile(event_profile: dict, profile_prefill: bool) -> dict:
+def _finalize_prefill_profile(
+    event_profile: dict,
+    profile_prefill: bool,
+    *,
+    profile_path: str,
+) -> dict:
     profile = {
-        "profile_schema_version": 2,
+        "profile_schema_version": 3,
         "profile_prefill_enabled": bool(profile_prefill),
+        "profile_path": profile_path,
     }
     profile.update(event_profile)
 
-    component_keys = (
+    if profile_path == "fast":
+        component_keys = (
+            "talker_forward_gpu_ms",
+            "first_sample_gpu_ms",
+            "prefill_kv_gpu_ms",
+            "generation_state_gpu_ms",
+            "prefill_to_sync_gpu_ms",
+        )
+        required_event_names = (
+            "start",
+            "after_forward",
+            "after_sample",
+            "after_prefill_kv",
+            "after_generation_state",
+            "before_sync",
+        )
+        stream_id_keys = (
+            "prefill_total_gpu_stream_id",
+            "talker_forward_gpu_stream_id",
+            "first_sample_gpu_stream_id",
+            "prefill_kv_gpu_stream_id",
+            "generation_state_gpu_stream_id",
+            "prefill_to_sync_gpu_stream_id",
+        )
+    elif profile_path == "parity":
+        component_keys = (
+            "talker_forward_gpu_ms",
+            "first_sample_gpu_ms",
+            "generation_state_gpu_ms",
+            "prefill_to_sync_gpu_ms",
+        )
+        required_event_names = (
+            "start",
+            "after_forward",
+            "after_sample",
+            "after_generation_state",
+            "before_sync",
+        )
+        stream_id_keys = (
+            "prefill_total_gpu_stream_id",
+            "talker_forward_gpu_stream_id",
+            "first_sample_gpu_stream_id",
+            "generation_state_gpu_stream_id",
+            "prefill_to_sync_gpu_stream_id",
+        )
+    else:
+        component_keys = ()
+        required_event_names = ()
+        stream_id_keys = ()
+
+    for key in (
+        "prefill_total_gpu_ms",
         "talker_forward_gpu_ms",
         "first_sample_gpu_ms",
         "prefill_kv_gpu_ms",
         "generation_state_gpu_ms",
         "prefill_to_sync_gpu_ms",
+        "prefill_total_gpu_stream_id",
+        "talker_forward_gpu_stream_id",
+        "first_sample_gpu_stream_id",
+        "prefill_kv_gpu_stream_id",
+        "generation_state_gpu_stream_id",
+        "prefill_to_sync_gpu_stream_id",
+    ):
+        profile.setdefault(key, None)
+    for name in required_event_names:
+        profile.setdefault(f"{name}_event_recorded", False)
+
+    profile["events_complete"] = all(
+        profile.get(f"{name}_event_recorded") is True
+        for name in required_event_names
     )
     component_values = [profile.get(key) for key in component_keys]
     components_complete = all(
         isinstance(value, (int, float)) for value in component_values
     )
+    profile["components_finite"] = components_complete and all(
+        math.isfinite(float(value)) for value in component_values
+    )
+    profile["components_nonnegative"] = components_complete and all(
+        float(value) >= 0.0 for value in component_values
+    )
+    stream_ids = [profile.get(key) for key in stream_id_keys]
+    present_stream_ids = [
+        int(value) for value in stream_ids if isinstance(value, int)
+    ]
+    profile["all_component_streams_equal"] = (
+        len(present_stream_ids) == len(stream_id_keys)
+        and len(set(present_stream_ids)) == 1
+    )
     total = profile.get("prefill_total_gpu_ms")
-    if components_complete:
+    if components_complete and isinstance(total, (int, float)):
         component_sum = float(sum(component_values))
         profile["prefill_gpu_component_sum_ms"] = component_sum
-        profile["prefill_gpu_accounting_error_ms"] = (
-            float(total) - component_sum if isinstance(total, (int, float)) else None
-        )
+        partition_error = float(total) - component_sum
+        profile["prefill_gpu_partition_error_ms"] = partition_error
+        profile["prefill_gpu_accounting_error_ms"] = partition_error
     else:
         profile["prefill_gpu_component_sum_ms"] = None
+        profile["prefill_gpu_partition_error_ms"] = None
         profile["prefill_gpu_accounting_error_ms"] = None
 
-    required_keys = ("prefill_total_gpu_ms", *component_keys)
-    profile["profile_complete"] = all(
-        isinstance(profile.get(key), (int, float)) for key in required_keys
+    total_complete = (
+        isinstance(total, (int, float))
+        and math.isfinite(float(total))
+        and float(total) >= 0.0
+    )
+    profile["profile_complete"] = bool(
+        profile_prefill
+        and profile["events_complete"]
+        and total_complete
+        and profile["components_finite"]
+        and profile["components_nonnegative"]
+        and profile["all_component_streams_equal"]
     )
     return profile
 
@@ -454,7 +597,13 @@ def parity_generate_streaming(
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
     nvtx_enabled = profile_prefill and device.type == "cuda"
+    outer_nvtx_name = _profile_outer_nvtx_name(input_metadata)
     prefill_events.record("start")
+    outer_nvtx_range = _CudaNvtxRange(
+        outer_nvtx_name,
+        nvtx_enabled and outer_nvtx_name is not None,
+    )
+    outer_nvtx_range.__enter__()
 
     forward_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_talker_forward", nvtx_enabled):
@@ -506,15 +655,21 @@ def parity_generate_streaming(
     ) * 1000
     prefill_events.record("after_generation_state")
 
+    prefill_events.record("before_sync")
     sync_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_final_sync", nvtx_enabled):
         torch.cuda.synchronize()
+    outer_nvtx_range.__exit__(None, None, None)
     prefill_profile["prefill_sync_wait_ms"] = (
         time.perf_counter() - sync_started
     ) * 1000
     t_prefill = time.perf_counter() - t_start
     prefill_profile.update(
-        _finalize_prefill_profile(prefill_events.elapsed_ms(), profile_prefill)
+        _finalize_prefill_profile(
+            prefill_events.elapsed_ms(profile_path="parity"),
+            profile_prefill,
+            profile_path="parity",
+        )
     )
 
     # === DECODE LOOP — yield chunks ===
