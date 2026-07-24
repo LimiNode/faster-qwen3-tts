@@ -5,8 +5,9 @@ Streaming generation with CUDA graphs for both predictor and talker.
 Yields codec ID chunks during generation instead of collecting all at once.
 CUDA graph usage is identical to non-streaming — same per-step performance.
 """
+
 import time
-from typing import Generator, Tuple
+from typing import Generator, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +36,8 @@ def fast_generate_streaming(
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
+    input_metadata: Optional[dict] = None,
+    profile_prefill: bool = False,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -57,7 +60,11 @@ def fast_generate_streaming(
 
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.time()
+    prefill_profile = {}
+    prefill_events = _PrefillEvents(device, profile_prefill)
+    prefill_events.record("start")
 
+    forward_started = time.time()
     out = talker.forward(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
@@ -70,11 +77,16 @@ def fast_generate_streaming(
         past_hidden=None,
         past_key_values=None,
     )
+    prefill_profile["talker_forward_launch_wall_ms"] = (
+        time.time() - forward_started
+    ) * 1000
+    prefill_events.record("after_forward")
 
     talker_past_kv = out.past_key_values
     past_hidden = out.past_hidden
     gen_step = out.generation_step
 
+    sample_started = time.time()
     logits = out.logits[:, -1, :]
     suppress_eos = min_new_tokens > 0
     token = sample_logits(
@@ -86,10 +98,25 @@ def fast_generate_streaming(
         suppress_mask=suppress_mask,
         suppress_tokens=eos_suppress_ids if suppress_eos else None,
     )
+    prefill_profile["first_sample_launch_wall_ms"] = (
+        time.time() - sample_started
+    ) * 1000
+    prefill_events.record("after_sample")
 
+    prefill_kv_started = time.time()
     prefill_len = talker_graph.prefill_kv(talker_past_kv)
+    prefill_profile["prefill_kv_launch_wall_ms"] = (
+        time.time() - prefill_kv_started
+    ) * 1000
+    prefill_events.record("after_prefill_kv")
+
+    generation_state_started = time.time()
     rope_deltas = getattr(talker, "rope_deltas", None)
     talker_graph.set_generation_state(attention_mask, rope_deltas)
+    prefill_profile["generation_state_wall_ms"] = (
+        time.time() - generation_state_started
+    ) * 1000
+    prefill_events.record("after_generation_state")
 
     # Deferred EOS detection (see fast_generate): tokens are copied to a pinned
     # host buffer asynchronously and checked one iteration late so the CPU never
@@ -99,9 +126,13 @@ def fast_generate_streaming(
     token_cpu, token_events = get_eos_tracker(device)
     token_cpu[0:1].copy_(token, non_blocking=True)
     token_events[0].record()
+    prefill_events.record("before_sync")
 
+    sync_started = time.time()
     torch.cuda.synchronize()
+    prefill_profile["prefill_sync_wait_ms"] = (time.time() - sync_started) * 1000
     t_prefill = time.time() - t_start
+    prefill_profile.update(prefill_events.elapsed_ms())
 
     # === DECODE LOOP — yield chunks ===
     chunk_buffer = []
@@ -141,7 +172,7 @@ def fast_generate_streaming(
         all_cb = torch.cat([token.view(1), codebook_token_ids])
         chunk_buffer.append(all_cb.detach())
         if rep_history is not None:
-            rep_history[step_idx:step_idx + 1] = token
+            rep_history[step_idx : step_idx + 1] = token
 
         # --- Build input embedding for talker ---
         # One fused gather over all 15 codebook tables; the cat+sum keeps the
@@ -149,10 +180,14 @@ def fast_generate_streaming(
         codebook_embeds = F.embedding(
             codebook_token_ids + fused_codec_offsets, fused_codec_weights
         ).unsqueeze(0)  # [1, 15, H]
-        inputs_embeds = torch.cat((last_id_hidden, codebook_embeds), dim=1).sum(1, keepdim=True)
+        inputs_embeds = torch.cat((last_id_hidden, codebook_embeds), dim=1).sum(
+            1, keepdim=True
+        )
 
         if gen_step < trailing_text_hiddens.shape[1]:
-            inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
+            inputs_embeds = inputs_embeds + trailing_text_hiddens[
+                :, gen_step
+            ].unsqueeze(1)
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
 
@@ -167,7 +202,7 @@ def fast_generate_streaming(
 
         if rep_history is not None:
             logits = apply_repetition_penalty(
-                logits, rep_history[:step_idx + 1], repetition_penalty
+                logits, rep_history[: step_idx + 1], repetition_penalty
             )
 
         suppress_eos = step_idx + 1 < min_new_tokens
@@ -181,7 +216,7 @@ def fast_generate_streaming(
             suppress_tokens=eos_suppress_ids if suppress_eos else None,
         )
         next_slot = (step_idx + 1) % 2
-        token_cpu[next_slot:next_slot + 1].copy_(token, non_blocking=True)
+        token_cpu[next_slot : next_slot + 1].copy_(token, non_blocking=True)
         token_events[next_slot].record()
         past_hidden = hidden_states[:, -1:, :].clone()
         gen_step += 1
@@ -199,14 +234,21 @@ def fast_generate_streaming(
             chunk_decode_time = time.time() - chunk_start
             total_steps += len(chunk_buffer)
 
-            yield torch.stack(chunk_buffer), {
-                'chunk_index': chunk_count,
-                'chunk_steps': len(chunk_buffer),
-                'prefill_ms': t_prefill * 1000 if chunk_count == 0 else 0,
-                'decode_ms': chunk_decode_time * 1000,
-                'total_steps_so_far': total_steps,
-                'is_final': eos_found,
-            }
+            yield (
+                torch.stack(chunk_buffer),
+                _chunk_timing(
+                    {
+                        "chunk_index": chunk_count,
+                        "chunk_steps": len(chunk_buffer),
+                        "prefill_ms": t_prefill * 1000 if chunk_count == 0 else 0,
+                        "decode_ms": chunk_decode_time * 1000,
+                        "total_steps_so_far": total_steps,
+                        "is_final": eos_found,
+                    },
+                    input_metadata=input_metadata,
+                    prefill_profile=prefill_profile if chunk_count == 0 else None,
+                ),
+            )
 
             chunk_buffer = []
             if eos_found:
@@ -228,14 +270,71 @@ def fast_generate_streaming(
         chunk_decode_time = time.time() - chunk_start
         total_steps += len(chunk_buffer)
 
-        yield torch.stack(chunk_buffer), {
-            'chunk_index': chunk_count,
-            'chunk_steps': len(chunk_buffer),
-            'prefill_ms': t_prefill * 1000 if chunk_count == 0 else 0,
-            'decode_ms': chunk_decode_time * 1000,
-            'total_steps_so_far': total_steps,
-            'is_final': True,
+        yield (
+            torch.stack(chunk_buffer),
+            _chunk_timing(
+                {
+                    "chunk_index": chunk_count,
+                    "chunk_steps": len(chunk_buffer),
+                    "prefill_ms": t_prefill * 1000 if chunk_count == 0 else 0,
+                    "decode_ms": chunk_decode_time * 1000,
+                    "total_steps_so_far": total_steps,
+                    "is_final": True,
+                },
+                input_metadata=input_metadata,
+                prefill_profile=prefill_profile if chunk_count == 0 else None,
+            ),
+        )
+
+
+class _PrefillEvents:
+    def __init__(self, device, enabled: bool):
+        self._enabled = enabled and device.type == "cuda"
+        self._events = {}
+
+    def record(self, name: str) -> None:
+        if not self._enabled:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self._events[name] = event
+
+    def elapsed_ms(self) -> dict:
+        if not self._enabled:
+            return {}
+        return {
+            "talker_forward_gpu_ms": self._elapsed("start", "after_forward"),
+            "first_sample_gpu_ms": self._elapsed("after_forward", "after_sample"),
+            "prefill_kv_gpu_ms": self._elapsed("after_sample", "after_prefill_kv"),
+            "generation_state_gpu_ms": self._elapsed(
+                "after_prefill_kv",
+                "after_generation_state",
+            ),
+            "prefill_to_sync_gpu_ms": self._elapsed(
+                "after_generation_state",
+                "before_sync",
+            ),
         }
+
+    def _elapsed(self, start_name: str, end_name: str) -> float:
+        start = self._events.get(start_name)
+        end = self._events.get(end_name)
+        if start is None or end is None:
+            return 0.0
+        return float(start.elapsed_time(end))
+
+
+def _chunk_timing(
+    timing: dict,
+    *,
+    input_metadata: Optional[dict],
+    prefill_profile: Optional[dict],
+) -> dict:
+    if input_metadata:
+        timing.update(input_metadata)
+    if prefill_profile:
+        timing.update(prefill_profile)
+    return timing
 
 
 @torch.inference_mode()
@@ -254,6 +353,8 @@ def parity_generate_streaming(
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
+    input_metadata: Optional[dict] = None,
+    profile_prefill: bool = False,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming generation without CUDA graphs (dynamic cache).
@@ -273,7 +374,11 @@ def parity_generate_streaming(
 
     # === PREFILL ===
     t_start = time.time()
+    prefill_profile = {}
+    prefill_events = _PrefillEvents(device, profile_prefill)
+    prefill_events.record("start")
 
+    forward_started = time.time()
     out = talker.forward(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
@@ -286,11 +391,16 @@ def parity_generate_streaming(
         past_hidden=None,
         past_key_values=None,
     )
+    prefill_profile["talker_forward_launch_wall_ms"] = (
+        time.time() - forward_started
+    ) * 1000
+    prefill_events.record("after_forward")
 
     talker_past_kv = out.past_key_values
     past_hidden = out.past_hidden
     gen_step = out.generation_step
 
+    sample_started = time.time()
     logits = out.logits[:, -1, :]
     suppress_eos = min_new_tokens > 0
     token = sample_logits(
@@ -302,12 +412,24 @@ def parity_generate_streaming(
         suppress_mask=suppress_mask,
         suppress_tokens=eos_suppress_ids if suppress_eos else None,
     )
+    prefill_profile["first_sample_launch_wall_ms"] = (
+        time.time() - sample_started
+    ) * 1000
+    prefill_events.record("after_sample")
 
+    generation_state_started = time.time()
     if attention_mask is not None:
         attention_mask = attention_mask.clone()
+    prefill_profile["generation_state_wall_ms"] = (
+        time.time() - generation_state_started
+    ) * 1000
+    prefill_events.record("after_generation_state")
 
+    sync_started = time.time()
     torch.cuda.synchronize()
+    prefill_profile["prefill_sync_wait_ms"] = (time.time() - sync_started) * 1000
     t_prefill = time.time() - t_start
+    prefill_profile.update(prefill_events.elapsed_ms())
 
     # === DECODE LOOP — yield chunks ===
     chunk_buffer = []
@@ -326,7 +448,9 @@ def parity_generate_streaming(
                 [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
                 dim=1,
             )
-            cache_position = torch.tensor([attention_mask.shape[1] - 1], device=attention_mask.device)
+            cache_position = torch.tensor(
+                [attention_mask.shape[1] - 1], device=attention_mask.device
+            )
 
         out = talker.forward(
             input_ids=token.view(1, 1),
@@ -378,14 +502,21 @@ def parity_generate_streaming(
             chunk_decode_time = time.time() - chunk_start
             total_steps += len(chunk_buffer)
 
-            yield torch.stack(chunk_buffer), {
-                'chunk_index': chunk_count,
-                'chunk_steps': len(chunk_buffer),
-                'prefill_ms': t_prefill * 1000 if chunk_count == 0 else 0,
-                'decode_ms': chunk_decode_time * 1000,
-                'total_steps_so_far': total_steps,
-                'is_final': False,
-            }
+            yield (
+                torch.stack(chunk_buffer),
+                _chunk_timing(
+                    {
+                        "chunk_index": chunk_count,
+                        "chunk_steps": len(chunk_buffer),
+                        "prefill_ms": t_prefill * 1000 if chunk_count == 0 else 0,
+                        "decode_ms": chunk_decode_time * 1000,
+                        "total_steps_so_far": total_steps,
+                        "is_final": False,
+                    },
+                    input_metadata=input_metadata,
+                    prefill_profile=prefill_profile if chunk_count == 0 else None,
+                ),
+            )
 
             chunk_buffer = []
             chunk_count += 1
@@ -396,11 +527,18 @@ def parity_generate_streaming(
         chunk_decode_time = time.time() - chunk_start
         total_steps += len(chunk_buffer)
 
-        yield torch.stack(chunk_buffer), {
-            'chunk_index': chunk_count,
-            'chunk_steps': len(chunk_buffer),
-            'prefill_ms': t_prefill * 1000 if chunk_count == 0 else 0,
-            'decode_ms': chunk_decode_time * 1000,
-            'total_steps_so_far': total_steps,
-            'is_final': True,
-        }
+        yield (
+            torch.stack(chunk_buffer),
+            _chunk_timing(
+                {
+                    "chunk_index": chunk_count,
+                    "chunk_steps": len(chunk_buffer),
+                    "prefill_ms": t_prefill * 1000 if chunk_count == 0 else 0,
+                    "decode_ms": chunk_decode_time * 1000,
+                    "total_steps_so_far": total_steps,
+                    "is_final": True,
+                },
+                input_metadata=input_metadata,
+                prefill_profile=prefill_profile if chunk_count == 0 else None,
+            ),
+        )

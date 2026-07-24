@@ -4,7 +4,9 @@ FasterQwen3TTS: Real-time TTS using CUDA graph capture.
 Wrapper class that provides a Qwen3-TTS API while using
 CUDA graphs for 6-10x speedup.
 """
+
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
@@ -17,16 +19,14 @@ from .utils import suppress_flash_attn_warning
 logger = logging.getLogger(__name__)
 
 
-
-
 class FasterQwen3TTS:
     """
     Qwen3-TTS model with CUDA graphs for real-time inference.
-    
+
     Compatible API with Qwen3TTSModel, but uses CUDA graph
     capture for 6-10x speedup on NVIDIA GPUs.
     """
-    
+
     def __init__(
         self,
         base_model,
@@ -97,12 +97,14 @@ class FasterQwen3TTS:
         ref_spk_emb: Optional[np.ndarray],
         ref_codes: Optional[np.ndarray],
     ) -> None:
-        if any(value is not None for value in (ref_spk, ref_rvq, ref_spk_emb, ref_codes)):
+        if any(
+            value is not None for value in (ref_spk, ref_rvq, ref_spk_emb, ref_codes)
+        ):
             raise NotImplementedError(
                 "ref_spk/ref_rvq cached qwentts.cpp references require backend='ggml'. "
                 "Use voice_clone_prompt for precomputed prompts with the torch backend."
             )
-        
+
     @classmethod
     def from_pretrained(
         cls,
@@ -141,20 +143,24 @@ class FasterQwen3TTS:
             qwentts_clamp_fp16: Whether qwentts.cpp should clamp fp16 operations.
             qwentts_ref_cache_dir: Optional cache directory for GGML voice-clone
                 `.spk` / `.rvq` references extracted from raw reference audio.
-            
+
         Returns:
             A backend-specific model implementing the public generation and
             warmup APIs.
         """
         if backend not in ("torch", "ggml", "qwentts"):
-            raise ValueError(f"Unsupported backend {backend!r}. Expected 'torch', 'ggml', or 'qwentts'.")
+            raise ValueError(
+                f"Unsupported backend {backend!r}. Expected 'torch', 'ggml', or 'qwentts'."
+            )
 
         if backend in ("ggml", "qwentts"):
             from .ggml_backend import GGMLQwen3TTS
 
             if gguf_talker_path is not None or gguf_codec_path is not None:
                 if gguf_talker_path is None or gguf_codec_path is None:
-                    raise ValueError("Both gguf_talker_path and gguf_codec_path are required for backend='ggml'")
+                    raise ValueError(
+                        "Both gguf_talker_path and gguf_codec_path are required for backend='ggml'"
+                    )
                 return GGMLQwen3TTS.from_gguf(
                     gguf_talker_path,
                     gguf_codec_path,
@@ -177,17 +183,18 @@ class FasterQwen3TTS:
 
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
-            
+
         if not device.startswith("cuda") or not torch.cuda.is_available():
             raise ValueError("CUDA graphs require CUDA device")
-        
+
         logger.info(f"Loading Qwen3-TTS model: {model_name}")
-        
+
         # Import here to avoid dependency issues (and suppress flash-attn warning)
         with suppress_flash_attn_warning():
             from qwen_tts import Qwen3TTSModel
         from .predictor_graph import PredictorGraph
         from .talker_graph import TalkerGraph
+
         # Load base model using qwen-tts library
         base_model = Qwen3TTSModel.from_pretrained(
             model_name,
@@ -195,7 +202,7 @@ class FasterQwen3TTS:
             torch_dtype=dtype,
             attn_implementation=attn_implementation,
         )
-        
+
         talker = base_model.model.talker
         talker_config = base_model.model.config.talker_config
 
@@ -216,7 +223,7 @@ class FasterQwen3TTS:
             top_k=50,
             temperature=0.9,
         )
-        
+
         talker_graph = TalkerGraph(
             talker.model,
             talker_config,
@@ -224,9 +231,9 @@ class FasterQwen3TTS:
             dtype=dtype,
             max_seq_len=max_seq_len,
         )
-        
+
         logger.info("CUDA graphs initialized (will capture on first run)")
-        
+
         return cls(
             base_model=base_model,
             predictor_graph=predictor_graph,
@@ -235,7 +242,7 @@ class FasterQwen3TTS:
             dtype=dtype,
             max_seq_len=max_seq_len,
         )
-    
+
     def warmup(self, prefill_len: int = 100) -> None:
         """Warm up the backend before generation.
 
@@ -244,7 +251,7 @@ class FasterQwen3TTS:
         """
         if self._warmed_up:
             return
-            
+
         logger.info("Warming up CUDA graphs...")
         self.predictor_graph.capture(num_warmup=3)
         self.talker_graph.capture(prefill_len=prefill_len, num_warmup=3)
@@ -254,7 +261,7 @@ class FasterQwen3TTS:
     def _warmup(self, prefill_len: int) -> None:
         """Compatibility alias for the former private warmup entry point."""
         self.warmup(prefill_len=prefill_len)
-    
+
     def generate(
         self,
         text: str,
@@ -267,15 +274,17 @@ class FasterQwen3TTS:
     ) -> Tuple[list, int]:
         """
         Generate speech from text using default voice.
-        
+
         Not yet implemented - use generate_voice_clone() instead.
         """
         raise NotImplementedError(
             "Default voice generation not yet implemented. "
             "Use generate_voice_clone() with reference audio."
         )
-    
-    def _load_ref_audio_with_silence(self, ref_audio: Union[str, Path], silence_secs: float = 0.5) -> Tuple[np.ndarray, int]:
+
+    def _load_ref_audio_with_silence(
+        self, ref_audio: Union[str, Path], silence_secs: float = 0.5
+    ) -> Tuple[np.ndarray, int]:
         """Load reference audio and optionally append trailing silence.
 
         The ICL voice-cloning prompt ends with the last codec token of the reference
@@ -309,7 +318,9 @@ class FasterQwen3TTS:
                 voice_clone_prompt=voice_clone_prompt,
             )
         if ref_audio is None:
-            raise ValueError("ref_audio is required when voice_clone_prompt is not provided")
+            raise ValueError(
+                "ref_audio is required when voice_clone_prompt is not provided"
+            )
 
         return self._resolve_voice_clone_prompt_from_reference(
             input_ids=input_ids,
@@ -367,7 +378,9 @@ class FasterQwen3TTS:
                     f"voice_clone_prompt[{key!r}] must be a list with length {len(input_ids)}"
                 )
 
-        xvec_modes = voice_clone_prompt.get("x_vector_only_mode", [True] * len(input_ids))
+        xvec_modes = voice_clone_prompt.get(
+            "x_vector_only_mode", [True] * len(input_ids)
+        )
         if "icl_mode" in voice_clone_prompt:
             icl_modes = [bool(v) for v in voice_clone_prompt["icl_mode"]]
             for i, (xvec_mode, icl_mode) in enumerate(zip(xvec_modes, icl_modes)):
@@ -380,7 +393,9 @@ class FasterQwen3TTS:
             icl_modes = [not bool(v) for v in xvec_modes]
 
         ref_codes = voice_clone_prompt.get("ref_code", [None] * len(input_ids))
-        for i, (xvec_mode, icl_mode, ref_code) in enumerate(zip(xvec_modes, icl_modes, ref_codes)):
+        for i, (xvec_mode, icl_mode, ref_code) in enumerate(
+            zip(xvec_modes, icl_modes, ref_codes)
+        ):
             if bool(xvec_mode) and ref_code is not None:
                 raise ValueError(
                     f"voice_clone_prompt index {i}: ref_code must be None in x_vector_only mode"
@@ -444,10 +459,11 @@ class FasterQwen3TTS:
             return vcp, ref_ids, using_icl_mode
 
         silence_secs = 0.5 if append_silence else 0.0
-        ref_audio_input = self._load_ref_audio_with_silence(ref_audio, silence_secs=silence_secs)
+        ref_audio_input = self._load_ref_audio_with_silence(
+            ref_audio, silence_secs=silence_secs
+        )
         prompt_items = self.model.create_voice_clone_prompt(
-            ref_audio=ref_audio_input,
-            ref_text=ref_text
+            ref_audio=ref_audio_input, ref_text=ref_text
         )
         vcp = self.model._prompt_items_to_voice_clone_prompt(prompt_items)
 
@@ -496,7 +512,11 @@ class FasterQwen3TTS:
 
         instruct_ids = [None]
         if instruct:
-            instruct_ids = [self.model._tokenize_texts([self.model._build_instruct_text(instruct)])[0]]
+            instruct_ids = [
+                self.model._tokenize_texts([self.model._build_instruct_text(instruct)])[
+                    0
+                ]
+            ]
 
         vcp, ref_ids, using_icl_mode = self._resolve_voice_clone_prompt(
             input_ids=input_ids,
@@ -549,7 +569,9 @@ class FasterQwen3TTS:
         speaker: Optional[str],
         instruct: Optional[str] = None,
         non_streaming_mode: bool = True,
+        return_metadata: bool = False,
     ):
+        tokenize_started = time.time()
         input_texts = [self.model._build_assistant_text(text)]
         input_ids = self.model._tokenize_texts(input_texts)
 
@@ -557,9 +579,15 @@ class FasterQwen3TTS:
         if instruct is None or instruct == "":
             instruct_ids.append(None)
         else:
-            instruct_ids.append(self.model._tokenize_texts([self.model._build_instruct_text(instruct)])[0])
+            instruct_ids.append(
+                self.model._tokenize_texts([self.model._build_instruct_text(instruct)])[
+                    0
+                ]
+            )
+        tokenize_wall_ms = (time.time() - tokenize_started) * 1000
 
         m = self.model.model
+        build_started = time.time()
         tie, tam, tth, tpe = self._build_talker_inputs_local(
             m=m,
             input_ids=input_ids,
@@ -570,6 +598,7 @@ class FasterQwen3TTS:
             non_streaming_mode=non_streaming_mode,
             instruct_ids=instruct_ids,
         )
+        build_talker_inputs_wall_ms = (time.time() - build_started) * 1000
 
         if not self._warmed_up:
             self.warmup(tie.shape[1])
@@ -577,6 +606,19 @@ class FasterQwen3TTS:
         talker = m.talker
         config = m.config.talker_config
         talker.rope_deltas = None
+
+        if return_metadata:
+            instruct_id = instruct_ids[0] if instruct_ids else None
+            metadata = {
+                "text_token_count": int(input_ids[0].shape[-1]) if input_ids else 0,
+                "instruction_token_count": (
+                    int(instruct_id.shape[-1]) if instruct_id is not None else 0
+                ),
+                "talker_prefill_length": int(tie.shape[1]),
+                "tokenize_wall_ms": tokenize_wall_ms,
+                "build_talker_inputs_wall_ms": build_talker_inputs_wall_ms,
+            }
+            return m, talker, config, tie, tam, tth, tpe, metadata
 
         return m, talker, config, tie, tam, tth, tpe
 
@@ -602,7 +644,9 @@ class FasterQwen3TTS:
             for index, instruct_id in enumerate(instruct_ids):
                 if instruct_id is not None:
                     talker_input_embeds[index].append(
-                        m.talker.text_projection(m.talker.get_text_embeddings()(instruct_id))
+                        m.talker.text_projection(
+                            m.talker.get_text_embeddings()(instruct_id)
+                        )
                     )
 
         if speakers is None:
@@ -611,7 +655,9 @@ class FasterQwen3TTS:
         trailing_text_hiddens = []
         tts_pad_embed = None
 
-        for index, (input_id, language, speaker) in enumerate(zip(input_ids, languages, speakers)):
+        for index, (input_id, language, speaker) in enumerate(
+            zip(input_ids, languages, speakers)
+        ):
             if voice_clone_spk_embeds is None:
                 if speaker == "" or speaker is None:
                     speaker_embed = None
@@ -620,10 +666,15 @@ class FasterQwen3TTS:
                         raise NotImplementedError(f"Speaker {speaker} not implemented")
                     spk_id = m.config.talker_config.spk_id[speaker.lower()]
                     speaker_embed = m.talker.get_input_embeddings()(
-                        torch.tensor(spk_id, device=m.talker.device, dtype=input_id.dtype)
+                        torch.tensor(
+                            spk_id, device=m.talker.device, dtype=input_id.dtype
+                        )
                     )
             else:
-                if voice_clone_prompt["x_vector_only_mode"][index] or voice_clone_prompt["icl_mode"][index]:
+                if (
+                    voice_clone_prompt["x_vector_only_mode"][index]
+                    or voice_clone_prompt["icl_mode"][index]
+                ):
                     speaker_embed = voice_clone_spk_embeds[index]
                 else:
                     speaker_embed = None
@@ -647,7 +698,13 @@ class FasterQwen3TTS:
             tts_bos_embed, tts_eos_embed, tts_pad_embed = m.talker.text_projection(
                 m.talker.get_text_embeddings()(
                     torch.tensor(
-                        [[m.config.tts_bos_token_id, m.config.tts_eos_token_id, m.config.tts_pad_token_id]],
+                        [
+                            [
+                                m.config.tts_bos_token_id,
+                                m.config.tts_eos_token_id,
+                                m.config.tts_pad_token_id,
+                            ]
+                        ],
                         device=m.talker.device,
                         dtype=input_id.dtype,
                     )
@@ -655,46 +712,73 @@ class FasterQwen3TTS:
             ).chunk(3, dim=1)
 
             if language_id is None:
-                codec_prefill_list = [[
-                    m.config.talker_config.codec_nothink_id,
-                    m.config.talker_config.codec_think_bos_id,
-                    m.config.talker_config.codec_think_eos_id,
-                ]]
+                codec_prefill_list = [
+                    [
+                        m.config.talker_config.codec_nothink_id,
+                        m.config.talker_config.codec_think_bos_id,
+                        m.config.talker_config.codec_think_eos_id,
+                    ]
+                ]
             else:
-                codec_prefill_list = [[
-                    m.config.talker_config.codec_think_id,
-                    m.config.talker_config.codec_think_bos_id,
-                    language_id,
-                    m.config.talker_config.codec_think_eos_id,
-                ]]
+                codec_prefill_list = [
+                    [
+                        m.config.talker_config.codec_think_id,
+                        m.config.talker_config.codec_think_bos_id,
+                        language_id,
+                        m.config.talker_config.codec_think_eos_id,
+                    ]
+                ]
 
             codec_input_emebdding_0 = m.talker.get_input_embeddings()(
-                torch.tensor(codec_prefill_list, device=m.talker.device, dtype=input_id.dtype)
+                torch.tensor(
+                    codec_prefill_list, device=m.talker.device, dtype=input_id.dtype
+                )
             )
             codec_input_emebdding_1 = m.talker.get_input_embeddings()(
                 torch.tensor(
-                    [[m.config.talker_config.codec_pad_id, m.config.talker_config.codec_bos_id]],
+                    [
+                        [
+                            m.config.talker_config.codec_pad_id,
+                            m.config.talker_config.codec_bos_id,
+                        ]
+                    ],
                     device=m.talker.device,
                     dtype=input_id.dtype,
                 )
             )
             if speaker_embed is None:
-                codec_input_emebdding = torch.cat([codec_input_emebdding_0, codec_input_emebdding_1], dim=1)
+                codec_input_emebdding = torch.cat(
+                    [codec_input_emebdding_0, codec_input_emebdding_1], dim=1
+                )
             else:
-                codec_input_emebdding = torch.cat([codec_input_emebdding_0, speaker_embed.view(1, 1, -1), codec_input_emebdding_1], dim=1)
+                codec_input_emebdding = torch.cat(
+                    [
+                        codec_input_emebdding_0,
+                        speaker_embed.view(1, 1, -1),
+                        codec_input_emebdding_1,
+                    ],
+                    dim=1,
+                )
 
             _talker_input_embed_role = m.talker.text_projection(
                 m.talker.get_text_embeddings()(input_id[:, :3])
             )
-            _talker_input_embed = torch.cat(
-                (
-                    tts_pad_embed.expand(-1, codec_input_emebdding.shape[1] - 2, -1),
-                    tts_bos_embed,
-                ),
-                dim=1,
-            ) + codec_input_emebdding[:, :-1]
+            _talker_input_embed = (
+                torch.cat(
+                    (
+                        tts_pad_embed.expand(
+                            -1, codec_input_emebdding.shape[1] - 2, -1
+                        ),
+                        tts_bos_embed,
+                    ),
+                    dim=1,
+                )
+                + codec_input_emebdding[:, :-1]
+            )
 
-            talker_input_embed = torch.cat((_talker_input_embed_role, _talker_input_embed), dim=1)
+            talker_input_embed = torch.cat(
+                (_talker_input_embed_role, _talker_input_embed), dim=1
+            )
 
             if (
                 voice_clone_prompt is not None
@@ -704,12 +788,16 @@ class FasterQwen3TTS:
                 icl_input_embed, trailing_text_hidden = m.generate_icl_prompt(
                     text_id=input_id[:, 3:-5],
                     ref_id=ref_ids[index][:, 3:-2],
-                    ref_code=voice_clone_prompt["ref_code"][index].to(m.talker.device).clone(),  # escape inference_mode context
+                    ref_code=voice_clone_prompt["ref_code"][index]
+                    .to(m.talker.device)
+                    .clone(),  # escape inference_mode context
                     tts_pad_embed=tts_pad_embed,
                     tts_eos_embed=tts_eos_embed,
                     non_streaming_mode=non_streaming_mode,
                 )
-                talker_input_embed = torch.cat([talker_input_embed, icl_input_embed], dim=1)
+                talker_input_embed = torch.cat(
+                    [talker_input_embed, icl_input_embed], dim=1
+                )
             else:
                 talker_input_embed = torch.cat(
                     [
@@ -729,7 +817,9 @@ class FasterQwen3TTS:
                             torch.cat(
                                 (
                                     m.talker.text_projection(
-                                        m.talker.get_text_embeddings()(input_id[:, 3:-5])
+                                        m.talker.get_text_embeddings()(
+                                            input_id[:, 3:-5]
+                                        )
                                     ),
                                     tts_eos_embed,
                                 ),
@@ -737,7 +827,10 @@ class FasterQwen3TTS:
                             )
                             + m.talker.get_input_embeddings()(
                                 torch.tensor(
-                                    [[m.config.talker_config.codec_pad_id] * (input_id[:, 3:-5].shape[1] + 1)],
+                                    [
+                                        [m.config.talker_config.codec_pad_id]
+                                        * (input_id[:, 3:-5].shape[1] + 1)
+                                    ],
                                     device=m.talker.device,
                                     dtype=input_id.dtype,
                                 )
@@ -769,7 +862,9 @@ class FasterQwen3TTS:
             trailing_text_hiddens.append(trailing_text_hidden)
 
         for index, talker_input_embed in enumerate(talker_input_embeds):
-            talker_input_embeds[index] = torch.cat([item for item in talker_input_embed if item is not None], dim=1)
+            talker_input_embeds[index] = torch.cat(
+                [item for item in talker_input_embed if item is not None], dim=1
+            )
 
         original_lengths = torch.tensor([t.shape[1] for t in talker_input_embeds])
         sequences = [t.squeeze(0) for t in talker_input_embeds]
@@ -784,7 +879,9 @@ class FasterQwen3TTS:
         batch_size, max_len = talker_input_embeds.shape[0], talker_input_embeds.shape[1]
         indices = torch.arange(max_len).expand(batch_size, -1)
         num_pads = max_len - original_lengths
-        talker_attention_mask = (indices >= num_pads.unsqueeze(1)).long().to(talker_input_embeds.device)
+        talker_attention_mask = (
+            (indices >= num_pads.unsqueeze(1)).long().to(talker_input_embeds.device)
+        )
 
         pad_embedding_vector = tts_pad_embed.squeeze()
         sequences_to_pad = [t.squeeze(0) for t in trailing_text_hiddens]
@@ -794,15 +891,22 @@ class FasterQwen3TTS:
             batch_first=True,
             padding_value=0.0,
         )
-        arange_tensor = torch.arange(max(trailing_text_original_lengths), device=padded_hiddens.device).expand(
-            len(trailing_text_original_lengths), -1
-        )
-        lengths_tensor = torch.tensor(trailing_text_original_lengths, device=padded_hiddens.device).unsqueeze(1)
+        arange_tensor = torch.arange(
+            max(trailing_text_original_lengths), device=padded_hiddens.device
+        ).expand(len(trailing_text_original_lengths), -1)
+        lengths_tensor = torch.tensor(
+            trailing_text_original_lengths, device=padded_hiddens.device
+        ).unsqueeze(1)
         padding_mask = arange_tensor >= lengths_tensor
         padded_hiddens[padding_mask] = pad_embedding_vector
         trailing_text_hiddens = padded_hiddens
 
-        return talker_input_embeds, talker_attention_mask, trailing_text_hiddens, tts_pad_embed
+        return (
+            talker_input_embeds,
+            talker_attention_mask,
+            trailing_text_hiddens,
+            tts_pad_embed,
+        )
 
     @torch.inference_mode()
     def generate_voice_clone(
@@ -921,32 +1025,34 @@ class FasterQwen3TTS:
             codes_for_decode = torch.cat([ref_codes_dev, codec_ids], dim=0)
         else:
             codes_for_decode = codec_ids
-        audio_list, sr = speech_tokenizer.decode({"audio_codes": codes_for_decode.unsqueeze(0)})
+        audio_list, sr = speech_tokenizer.decode(
+            {"audio_codes": codes_for_decode.unsqueeze(0)}
+        )
 
         # Convert to numpy and trim off the reference audio portion
         ref_len = ref_codes.shape[0] if ref_codes is not None else 0
         total_len = codes_for_decode.shape[0]
         audio_arrays = []
         for a in audio_list:
-            if hasattr(a, 'cpu'):  # torch tensor
+            if hasattr(a, "cpu"):  # torch tensor
                 a = a.flatten().cpu().numpy()
             else:  # already numpy
-                a = a.flatten() if hasattr(a, 'flatten') else a
+                a = a.flatten() if hasattr(a, "flatten") else a
             if ref_len > 0:
                 cut = int(ref_len / max(total_len, 1) * len(a))
                 a = a[cut:]
             audio_arrays.append(a)
-        
-        n_steps = timing['steps']
+
+        n_steps = timing["steps"]
         audio_duration = n_steps / 12.0  # 12 Hz codec
-        total_time = timing['prefill_ms']/1000 + timing['decode_s']
+        total_time = timing["prefill_ms"] / 1000 + timing["decode_s"]
         rtf = audio_duration / total_time if total_time > 0 else 0
-        
+
         logger.info(
             f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
             f"({timing['ms_per_step']:.1f}ms/step, RTF: {rtf:.2f})"
         )
-        
+
         return audio_arrays, sr
 
     @torch.inference_mode()
@@ -1055,7 +1161,9 @@ class FasterQwen3TTS:
         prev_gen_audio_len = 0  # tracks position within the generated (non-ref) audio
         samples_per_frame = None
 
-        stream_fn = parity_generate_streaming if parity_mode else fast_generate_streaming
+        stream_fn = (
+            parity_generate_streaming if parity_mode else fast_generate_streaming
+        )
         stream_kwargs = dict(
             talker=talker,
             talker_input_embeds=tie,
@@ -1087,17 +1195,19 @@ class FasterQwen3TTS:
                 # In ICL mode prepend reference codes so the codec decoder has acoustic
                 # context from the reference audio (matches official implementation).
                 if ref_codes is not None:
-                    codes_input = torch.cat([ref_codes.to(all_flat.device), all_flat], dim=0)
+                    codes_input = torch.cat(
+                        [ref_codes.to(all_flat.device), all_flat], dim=0
+                    )
                 else:
                     codes_input = all_flat
                 audio_list, sr = speech_tokenizer.decode(
                     {"audio_codes": codes_input.unsqueeze(0)}
                 )
                 audio = audio_list[0]
-                if hasattr(audio, 'cpu'):
+                if hasattr(audio, "cpu"):
                     audio = audio.flatten().cpu().numpy()
                 else:
-                    audio = audio.flatten() if hasattr(audio, 'flatten') else audio
+                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
 
                 # Separate out reference audio portion; track position in generated audio only
                 if ref_codes is not None:
@@ -1123,10 +1233,10 @@ class FasterQwen3TTS:
                     {"audio_codes": window.unsqueeze(0)}
                 )
                 audio = audio_list[0]
-                if hasattr(audio, 'cpu'):
+                if hasattr(audio, "cpu"):
                     audio = audio.flatten().cpu().numpy()
                 else:
-                    audio = audio.flatten() if hasattr(audio, 'flatten') else audio
+                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
 
                 if n_ctx > 0:
                     ctx_samples = int(round(n_ctx * samples_per_frame))
@@ -1199,7 +1309,9 @@ class FasterQwen3TTS:
             return [np.zeros(1, dtype=np.float32)], self.sample_rate
 
         speech_tokenizer = m.speech_tokenizer
-        audio_list, sr = speech_tokenizer.decode({"audio_codes": codec_ids.unsqueeze(0)})
+        audio_list, sr = speech_tokenizer.decode(
+            {"audio_codes": codec_ids.unsqueeze(0)}
+        )
 
         audio_arrays = []
         for a in audio_list:
@@ -1236,6 +1348,7 @@ class FasterQwen3TTS:
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
+        profile_prefill: bool = False,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "custom_voice":
             raise ValueError("Loaded model does not support custom voice generation")
@@ -1253,12 +1366,15 @@ class FasterQwen3TTS:
 
         from .streaming import fast_generate_streaming
 
-        m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
-            text=text,
-            language=language,
-            speaker=speaker,
-            instruct=instruct,
-            non_streaming_mode=non_streaming_mode,
+        m, talker, config, tie, tam, tth, tpe, input_metadata = (
+            self._prepare_generation_custom(
+                text=text,
+                language=language,
+                speaker=speaker,
+                instruct=instruct,
+                non_streaming_mode=non_streaming_mode,
+                return_metadata=True,
+            )
         )
 
         speech_tokenizer = m.speech_tokenizer
@@ -1286,6 +1402,8 @@ class FasterQwen3TTS:
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
+            input_metadata=input_metadata,
+            profile_prefill=profile_prefill,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
@@ -1293,7 +1411,9 @@ class FasterQwen3TTS:
             n_total = all_flat.shape[0]
 
             if samples_per_frame is None:
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": all_flat.unsqueeze(0)})
+                audio_list, sr = speech_tokenizer.decode(
+                    {"audio_codes": all_flat.unsqueeze(0)}
+                )
                 audio = audio_list[0]
                 if hasattr(audio, "cpu"):
                     audio = audio.flatten().cpu().numpy()
@@ -1310,7 +1430,9 @@ class FasterQwen3TTS:
                 window = all_flat[ctx_start:]
                 n_ctx = window.shape[0] - n_new
 
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": window.unsqueeze(0)})
+                audio_list, sr = speech_tokenizer.decode(
+                    {"audio_codes": window.unsqueeze(0)}
+                )
                 audio = audio_list[0]
                 if hasattr(audio, "cpu"):
                     audio = audio.flatten().cpu().numpy()
@@ -1383,7 +1505,9 @@ class FasterQwen3TTS:
             return [np.zeros(1, dtype=np.float32)], self.sample_rate
 
         speech_tokenizer = m.speech_tokenizer
-        audio_list, sr = speech_tokenizer.decode({"audio_codes": codec_ids.unsqueeze(0)})
+        audio_list, sr = speech_tokenizer.decode(
+            {"audio_codes": codec_ids.unsqueeze(0)}
+        )
 
         audio_arrays = []
         for a in audio_list:
@@ -1419,6 +1543,7 @@ class FasterQwen3TTS:
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
+        profile_prefill: bool = False,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "voice_design":
             raise ValueError("Loaded model does not support voice design generation")
@@ -1432,12 +1557,15 @@ class FasterQwen3TTS:
 
         from .streaming import fast_generate_streaming
 
-        m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
-            text=text,
-            language=language,
-            speaker=None,
-            instruct=instruct,
-            non_streaming_mode=non_streaming_mode,
+        m, talker, config, tie, tam, tth, tpe, input_metadata = (
+            self._prepare_generation_custom(
+                text=text,
+                language=language,
+                speaker=None,
+                instruct=instruct,
+                non_streaming_mode=non_streaming_mode,
+                return_metadata=True,
+            )
         )
 
         speech_tokenizer = m.speech_tokenizer
@@ -1465,6 +1593,8 @@ class FasterQwen3TTS:
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
+            input_metadata=input_metadata,
+            profile_prefill=profile_prefill,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
@@ -1472,7 +1602,9 @@ class FasterQwen3TTS:
             n_total = all_flat.shape[0]
 
             if samples_per_frame is None:
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": all_flat.unsqueeze(0)})
+                audio_list, sr = speech_tokenizer.decode(
+                    {"audio_codes": all_flat.unsqueeze(0)}
+                )
                 audio = audio_list[0]
                 if hasattr(audio, "cpu"):
                     audio = audio.flatten().cpu().numpy()
@@ -1489,7 +1621,9 @@ class FasterQwen3TTS:
                 window = all_flat[ctx_start:]
                 n_ctx = window.shape[0] - n_new
 
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": window.unsqueeze(0)})
+                audio_list, sr = speech_tokenizer.decode(
+                    {"audio_codes": window.unsqueeze(0)}
+                )
                 audio = audio_list[0]
                 if hasattr(audio, "cpu"):
                     audio = audio.flatten().cpu().numpy()
