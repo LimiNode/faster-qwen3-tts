@@ -1349,6 +1349,7 @@ class FasterQwen3TTS:
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
         profile_prefill: bool = False,
+        profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "custom_voice":
@@ -1407,6 +1408,7 @@ class FasterQwen3TTS:
             chunk_size=chunk_size,
             input_metadata=input_metadata,
             profile_prefill=profile_prefill,
+            profile_nvtx=profile_nvtx,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
@@ -1547,6 +1549,7 @@ class FasterQwen3TTS:
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
         profile_prefill: bool = False,
+        profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "voice_design":
@@ -1601,6 +1604,7 @@ class FasterQwen3TTS:
             chunk_size=chunk_size,
             input_metadata=input_metadata,
             profile_prefill=profile_prefill,
+            profile_nvtx=profile_nvtx,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]

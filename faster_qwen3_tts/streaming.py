@@ -55,6 +55,7 @@ def fast_generate_streaming(
     chunk_size: int = 12,
     input_metadata: Optional[dict] = None,
     profile_prefill: bool = False,
+    profile_nvtx: bool = False,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -79,7 +80,7 @@ def fast_generate_streaming(
     t_start = time.perf_counter()
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
-    nvtx_enabled = profile_prefill and device.type == "cuda"
+    nvtx_enabled = profile_nvtx and device.type == "cuda"
     outer_nvtx_name = _profile_outer_nvtx_name(input_metadata)
     prefill_events.record("start")
     outer_nvtx_range = _CudaNvtxRange(
@@ -330,25 +331,39 @@ def _profile_outer_nvtx_name(input_metadata: Optional[dict]) -> Optional[str]:
         return None
     request_role = input_metadata.get("profile_request_role")
     if request_role == "first_user":
-        return "qtb_profile_first_user_request"
+        return "qtb_profile_first_user_prefill"
     if request_role == "steady":
-        return "qtb_profile_steady_request"
+        return "qtb_profile_steady_prefill"
     return None
 
 
 class _PrefillEvents:
+    _KNOWN_EVENTS = (
+        "start",
+        "after_forward",
+        "after_sample",
+        "after_prefill_kv",
+        "after_generation_state",
+        "before_sync",
+    )
+
     def __init__(self, device, enabled: bool):
         self._enabled = enabled and device.type == "cuda"
-        self._events = {}
+        self._events = {
+            name: torch.cuda.Event(enable_timing=True)
+            for name in self._KNOWN_EVENTS
+        } if self._enabled else {}
         self._stream_ids = {}
 
     def record(self, name: str) -> None:
         if not self._enabled:
             return
         stream = torch.cuda.current_stream()
-        event = torch.cuda.Event(enable_timing=True)
+        event = self._events.get(name)
+        if event is None:
+            event = torch.cuda.Event(enable_timing=True)
+            self._events[name] = event
         event.record(stream)
-        self._events[name] = event
         self._stream_ids[name] = int(stream.cuda_stream)
 
     def elapsed_ms(self, *, profile_path: str) -> dict:
@@ -419,9 +434,13 @@ def _finalize_prefill_profile(
     *,
     profile_path: str,
 ) -> dict:
+    if not profile_prefill:
+        return _disabled_prefill_profile(profile_path)
+
     profile = {
         "profile_schema_version": 3,
         "profile_prefill_enabled": bool(profile_prefill),
+        "profile_status": "complete",
         "profile_path": profile_path,
     }
     profile.update(event_profile)
@@ -541,6 +560,41 @@ def _finalize_prefill_profile(
         and profile["components_nonnegative"]
         and profile["all_component_streams_equal"]
     )
+    if not profile["profile_complete"]:
+        profile["profile_status"] = "incomplete"
+    return profile
+
+
+def _disabled_prefill_profile(profile_path: str) -> dict:
+    profile = {
+        "profile_schema_version": 3,
+        "profile_prefill_enabled": False,
+        "profile_status": "disabled",
+        "profile_path": profile_path,
+    }
+    for key in (
+        "prefill_total_gpu_ms",
+        "talker_forward_gpu_ms",
+        "first_sample_gpu_ms",
+        "prefill_kv_gpu_ms",
+        "generation_state_gpu_ms",
+        "prefill_to_sync_gpu_ms",
+        "prefill_total_gpu_stream_id",
+        "talker_forward_gpu_stream_id",
+        "first_sample_gpu_stream_id",
+        "prefill_kv_gpu_stream_id",
+        "generation_state_gpu_stream_id",
+        "prefill_to_sync_gpu_stream_id",
+        "prefill_gpu_component_sum_ms",
+        "prefill_gpu_partition_error_ms",
+        "prefill_gpu_accounting_error_ms",
+        "profile_complete",
+        "events_complete",
+        "components_finite",
+        "components_nonnegative",
+        "all_component_streams_equal",
+    ):
+        profile[key] = None
     return profile
 
 
@@ -575,6 +629,7 @@ def parity_generate_streaming(
     chunk_size: int = 12,
     input_metadata: Optional[dict] = None,
     profile_prefill: bool = False,
+    profile_nvtx: bool = False,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming generation without CUDA graphs (dynamic cache).
@@ -596,7 +651,7 @@ def parity_generate_streaming(
     t_start = time.perf_counter()
     prefill_profile = {}
     prefill_events = _PrefillEvents(device, profile_prefill)
-    nvtx_enabled = profile_prefill and device.type == "cuda"
+    nvtx_enabled = profile_nvtx and device.type == "cuda"
     outer_nvtx_name = _profile_outer_nvtx_name(input_metadata)
     prefill_events.record("start")
     outer_nvtx_range = _CudaNvtxRange(
