@@ -1351,6 +1351,7 @@ class FasterQwen3TTS:
         profile_prefill: bool = False,
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
+        prefill_backend: str = "eager",
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "custom_voice":
             raise ValueError("Loaded model does not support custom voice generation")
@@ -1409,6 +1410,7 @@ class FasterQwen3TTS:
             input_metadata=input_metadata,
             profile_prefill=profile_prefill,
             profile_nvtx=profile_nvtx,
+            prefill_backend=prefill_backend,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
@@ -1551,6 +1553,7 @@ class FasterQwen3TTS:
         profile_prefill: bool = False,
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
+        prefill_backend: str = "eager",
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "voice_design":
             raise ValueError("Loaded model does not support voice design generation")
@@ -1605,6 +1608,7 @@ class FasterQwen3TTS:
             input_metadata=input_metadata,
             profile_prefill=profile_prefill,
             profile_nvtx=profile_nvtx,
+            prefill_backend=prefill_backend,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
