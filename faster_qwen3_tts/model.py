@@ -32,12 +32,14 @@ class FasterQwen3TTS:
         base_model,
         predictor_graph,
         talker_graph,
+        predictor_graph_greedy=None,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         max_seq_len: int = 2048,
     ):
         self.model = base_model  # The qwen-tts Qwen3TTSModel instance
         self.predictor_graph = predictor_graph
+        self.predictor_graph_greedy = predictor_graph_greedy
         self.talker_graph = talker_graph
         self.device = device
         self.dtype = dtype
@@ -89,6 +91,12 @@ class FasterQwen3TTS:
     ) -> bool:
         """Treat None as the method-specific upstream default."""
         return default if non_streaming_mode is None else non_streaming_mode
+
+    def _select_predictor_graph(self, do_sample: bool):
+        """Return a predictor graph whose sampling mode matches the request."""
+        if do_sample or self.predictor_graph_greedy is None:
+            return self.predictor_graph
+        return self.predictor_graph_greedy
 
     @staticmethod
     def _reject_ggml_cached_reference_args(
@@ -223,6 +231,17 @@ class FasterQwen3TTS:
             top_k=50,
             temperature=0.9,
         )
+        predictor_graph_greedy = PredictorGraph(
+            predictor,
+            pred_config,
+            talker_hidden,
+            device=device,
+            dtype=dtype,
+            do_sample=False,
+            top_k=0,
+            top_p=1.0,
+            temperature=1.0,
+        )
 
         talker_graph = TalkerGraph(
             talker.model,
@@ -237,6 +256,7 @@ class FasterQwen3TTS:
         return cls(
             base_model=base_model,
             predictor_graph=predictor_graph,
+            predictor_graph_greedy=predictor_graph_greedy,
             talker_graph=talker_graph,
             device=device,
             dtype=dtype,
@@ -254,6 +274,8 @@ class FasterQwen3TTS:
 
         logger.info("Warming up CUDA graphs...")
         self.predictor_graph.capture(num_warmup=3)
+        if self.predictor_graph_greedy is not None:
+            self.predictor_graph_greedy.capture(num_warmup=3)
         self.talker_graph.capture(prefill_len=prefill_len, num_warmup=3)
         self._warmed_up = True
         logger.info("CUDA graphs captured and ready")
@@ -1002,7 +1024,7 @@ class FasterQwen3TTS:
             trailing_text_hiddens=tth,
             tts_pad_embed=tpe,
             config=config,
-            predictor_graph=self.predictor_graph,
+            predictor_graph=self._select_predictor_graph(do_sample),
             talker_graph=self.talker_graph,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
@@ -1181,7 +1203,7 @@ class FasterQwen3TTS:
             chunk_size=chunk_size,
         )
         if not parity_mode:
-            stream_kwargs["predictor_graph"] = self.predictor_graph
+            stream_kwargs["predictor_graph"] = self._select_predictor_graph(do_sample)
             stream_kwargs["talker_graph"] = self.talker_graph
 
         for codec_chunk, timing in stream_fn(**stream_kwargs):
@@ -1293,7 +1315,7 @@ class FasterQwen3TTS:
             trailing_text_hiddens=tth,
             tts_pad_embed=tpe,
             config=config,
-            predictor_graph=self.predictor_graph,
+            predictor_graph=self._select_predictor_graph(do_sample),
             talker_graph=self.talker_graph,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
@@ -1397,7 +1419,7 @@ class FasterQwen3TTS:
             trailing_text_hiddens=tth,
             tts_pad_embed=tpe,
             config=config,
-            predictor_graph=self.predictor_graph,
+            predictor_graph=self._select_predictor_graph(do_sample),
             talker_graph=self.talker_graph,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
@@ -1496,7 +1518,7 @@ class FasterQwen3TTS:
             trailing_text_hiddens=tth,
             tts_pad_embed=tpe,
             config=config,
-            predictor_graph=self.predictor_graph,
+            predictor_graph=self._select_predictor_graph(do_sample),
             talker_graph=self.talker_graph,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
@@ -1595,7 +1617,7 @@ class FasterQwen3TTS:
             trailing_text_hiddens=tth,
             tts_pad_embed=tpe,
             config=config,
-            predictor_graph=self.predictor_graph,
+            predictor_graph=self._select_predictor_graph(do_sample),
             talker_graph=self.talker_graph,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,

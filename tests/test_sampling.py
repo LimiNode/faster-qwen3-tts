@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from faster_qwen3_tts.generate import fast_generate
+from faster_qwen3_tts.model import FasterQwen3TTS
 from faster_qwen3_tts.sampling import apply_repetition_penalty
+from faster_qwen3_tts.sampling import sample_logits
 
 
 def test_repetition_penalty_uses_all_history():
@@ -19,6 +21,35 @@ def test_repetition_penalty_uses_all_history():
     out = apply_repetition_penalty(logits.clone(), history, repetition_penalty=1.1)
     assert pytest.approx(out[0, 0, 7].item(), rel=1e-6) == 1.0 / 1.1
     assert pytest.approx(out[0, 0, 8].item(), rel=1e-6) == -1.0 * 1.1
+
+
+def test_sample_logits_greedy_does_not_call_multinomial(monkeypatch):
+    def fail_multinomial(*args, **kwargs):
+        raise AssertionError("greedy sampling must not call torch.multinomial")
+
+    monkeypatch.setattr(torch, "multinomial", fail_multinomial)
+
+    logits = torch.tensor([[0.1, 1.0, 0.5]])
+    token = sample_logits(
+        logits,
+        temperature=0.9,
+        top_k=50,
+        top_p=1.0,
+        do_sample=False,
+    )
+
+    assert token.tolist() == [1]
+
+
+def test_faster_wrapper_selects_greedy_predictor_graph():
+    sampling_graph = types.SimpleNamespace(do_sample=True)
+    greedy_graph = types.SimpleNamespace(do_sample=False)
+    model = FasterQwen3TTS.__new__(FasterQwen3TTS)
+    model.predictor_graph = sampling_graph
+    model.predictor_graph_greedy = greedy_graph
+
+    assert model._select_predictor_graph(True) is sampling_graph
+    assert model._select_predictor_graph(False) is greedy_graph
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_generate syncs.")
