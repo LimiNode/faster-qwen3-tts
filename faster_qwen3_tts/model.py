@@ -94,8 +94,10 @@ class FasterQwen3TTS:
 
     def _select_predictor_graph(self, do_sample: bool):
         """Return a predictor graph whose sampling mode matches the request."""
-        if do_sample or self.predictor_graph_greedy is None:
+        if do_sample:
             return self.predictor_graph
+        if self.predictor_graph_greedy is None:
+            raise RuntimeError("Greedy PredictorGraph is unavailable for do_sample=False")
         return self.predictor_graph_greedy
 
     @staticmethod

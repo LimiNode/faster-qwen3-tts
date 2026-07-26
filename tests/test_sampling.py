@@ -51,6 +51,10 @@ def test_faster_wrapper_selects_greedy_predictor_graph():
     assert model._select_predictor_graph(True) is sampling_graph
     assert model._select_predictor_graph(False) is greedy_graph
 
+    model.predictor_graph_greedy = None
+    with pytest.raises(RuntimeError, match="Greedy PredictorGraph is unavailable"):
+        model._select_predictor_graph(False)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_generate syncs.")
 def test_min_new_tokens_suppresses_early_eos():
