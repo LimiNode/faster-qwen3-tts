@@ -25,6 +25,7 @@ _PREFILL_BACKENDS = {
     "compile_backend_aot_eager",
     "compile_default",
     "compile_inductor_default",
+    "compile_inductor_graphbreak",
     "compile_reduce_overhead",
 }
 _PREFILL_BACKEND_ALIASES = {
@@ -213,6 +214,7 @@ def _compile_talker_prefill(talker, prefill_backend: str) -> Callable:
         backend = "aot_eager"
     elif prefill_backend == "compile_reduce_overhead":
         mode = "reduce-overhead"
+    fullgraph = prefill_backend != "compile_inductor_graphbreak"
 
     def prefill_fn(
         inputs_embeds: torch.Tensor,
@@ -233,7 +235,7 @@ def _compile_talker_prefill(talker, prefill_backend: str) -> Callable:
     return torch.compile(
         prefill_fn,
         backend=backend,
-        fullgraph=True,
+        fullgraph=fullgraph,
         dynamic=False,
         mode=mode,
     )
