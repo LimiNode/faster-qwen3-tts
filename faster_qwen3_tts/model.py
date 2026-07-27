@@ -17,6 +17,7 @@ import torch
 from .prefill_compat import (
     configure_prefill_compile_compat,
     normalize_prefill_compile_compat_mode,
+    prefill_compile_compat_metadata,
 )
 from .utils import suppress_flash_attn_warning
 
@@ -143,6 +144,16 @@ class FasterQwen3TTS:
                 f"{self.prefill_compile_compat_mode!r}."
             )
         return requested_mode
+
+    @property
+    def prefill_compile_compat_metadata(self) -> Dict[str, Any]:
+        """Return immutable Talker prefill compatibility metadata."""
+        talker = self.model.model.talker
+        metadata = prefill_compile_compat_metadata(talker)
+        metadata["prefill_compile_compat_wrapper_mode"] = (
+            self.prefill_compile_compat_mode
+        )
+        return metadata
 
     @staticmethod
     def _reject_ggml_cached_reference_args(
@@ -322,6 +333,9 @@ class FasterQwen3TTS:
             device=device,
             dtype=dtype,
             max_seq_len=max_seq_len,
+            prefill_compile_compat_mode=(
+                normalized_prefill_compile_compat_mode or "none"
+            ),
         )
 
     def warmup(self, prefill_len: int = 100) -> None:

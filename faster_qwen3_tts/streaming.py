@@ -17,6 +17,7 @@ from .generate import get_eos_tracker, get_fused_codec_embeddings
 from .prefill_compat import (
     ensure_prefill_compile_compat,
     normalize_prefill_compile_compat_mode,
+    prefill_compile_compat_context,
     validate_strict_bf16_sdpa_v1,
 )
 from .predictor_graph import PredictorGraph
@@ -150,17 +151,22 @@ def _run_talker_prefill(
         profile.update(
             ensure_prefill_compile_compat(talker, prefill_compile_compat_mode)
         )
-        compiled = _PREFILL_COMPILE_CACHE.get(cache_key)
-        if compiled is None:
-            compiled = _compile_talker_prefill(talker, prefill_backend)
-            _PREFILL_COMPILE_CACHE[cache_key] = compiled
-        out = compiled(
-            talker_input_embeds,
-            prefill_attention_mask,
-            trailing_text_hiddens,
-            tts_pad_embed,
-            skip_prefill_causal_mask,
-        )
+        with prefill_compile_compat_context(
+            talker,
+            prefill_compile_compat_mode,
+        ) as metadata:
+            profile.update(metadata)
+            compiled = _PREFILL_COMPILE_CACHE.get(cache_key)
+            if compiled is None:
+                compiled = _compile_talker_prefill(talker, prefill_backend)
+                _PREFILL_COMPILE_CACHE[cache_key] = compiled
+            out = compiled(
+                talker_input_embeds,
+                prefill_attention_mask,
+                trailing_text_hiddens,
+                tts_pad_embed,
+                skip_prefill_causal_mask,
+            )
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         _PREFILL_COMPILE_ERRORS[cache_key] = message

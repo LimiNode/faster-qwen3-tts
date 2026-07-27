@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import types
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import Any, Optional
 
 import torch
@@ -16,6 +18,7 @@ SUPPORTED_PREFILL_COMPILE_COMPAT_MODES = {
     "none",
     "strict_bf16_sdpa_v1",
 }
+PREFILL_COMPILE_COMPAT_METADATA_VERSION = 1
 
 
 @torch.library.custom_op("faster_qwen3_tts::strict_add", mutates_args=())
@@ -134,11 +137,16 @@ def configure_prefill_compile_compat(talker: Any, mode: str) -> dict[str, Any]:
         talker._faster_qwen3_tts_prefill_compile_compat_declared_mode = mode
         talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
         talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = {}
+        talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = {}
         return prefill_compile_compat_metadata(talker)
 
-    metadata = apply_prefill_compile_compat(talker, mode)
+    targets = _collect_prefill_compile_compat_targets(talker)
+    patched = _validated_prefill_compile_compat_counts(targets)
     talker._faster_qwen3_tts_prefill_compile_compat_declared_mode = mode
-    return metadata
+    talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
+    talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = {}
+    talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = dict(patched)
+    return prefill_compile_compat_metadata(talker)
 
 
 def ensure_prefill_compile_compat(talker: Any, requested_mode: str) -> dict[str, Any]:
@@ -176,14 +184,15 @@ def ensure_prefill_compile_compat(talker: Any, requested_mode: str) -> dict[str,
 
 
 def prefill_compile_compat_metadata(talker: Any) -> dict[str, Any]:
+    declared = getattr(
+        talker,
+        "_faster_qwen3_tts_prefill_compile_compat_declared_mode",
+        None,
+    )
     mode = getattr(
         talker,
         "_faster_qwen3_tts_prefill_compile_compat_mode",
-        getattr(
-            talker,
-            "_faster_qwen3_tts_prefill_compile_compat_declared_mode",
-            "none",
-        ),
+        declared or "none",
     )
     patched = dict(
         getattr(
@@ -192,12 +201,81 @@ def prefill_compile_compat_metadata(talker: Any) -> dict[str, Any]:
             {},
         )
     )
+    validated = dict(
+        getattr(
+            talker,
+            "_faster_qwen3_tts_prefill_compile_compat_validated_modules",
+            patched,
+        )
+    )
     return {
+        "prefill_compile_compat_metadata_version": (
+            PREFILL_COMPILE_COMPAT_METADATA_VERSION
+        ),
+        "prefill_compile_compat_declared_mode": (
+            normalize_prefill_compile_compat_mode(declared)
+            if declared is not None
+            else None
+        ),
         "prefill_compile_compat_mode": normalize_prefill_compile_compat_mode(mode),
         "prefill_compile_compat_applied": bool(patched),
         "prefill_compile_compat_reused": bool(patched),
         "prefill_compile_compat_patched_modules": patched,
+        "prefill_compile_compat_validated_modules": validated,
     }
+
+
+@contextmanager
+def prefill_compile_compat_context(
+    talker: Any,
+    mode: str,
+) -> Iterator[dict[str, Any]]:
+    """Temporarily install strict forwards for a compiled prefill call."""
+    mode = normalize_prefill_compile_compat_mode(mode)
+    if mode == "none":
+        yield prefill_compile_compat_metadata(talker)
+        return
+
+    declared = getattr(
+        talker,
+        "_faster_qwen3_tts_prefill_compile_compat_declared_mode",
+        None,
+    )
+    if declared is not None and declared != mode:
+        raise RuntimeError(
+            "Requested prefill compile compatibility mode does not match the "
+            f"loaded model: requested {mode!r}, loaded {declared!r}."
+        )
+    if getattr(talker, "_faster_qwen3_tts_prefill_compile_compat_active", False):
+        yield prefill_compile_compat_metadata(talker)
+        return
+
+    targets = _collect_prefill_compile_compat_targets(talker)
+    patched = _validated_prefill_compile_compat_counts(targets)
+    originals = []
+    try:
+        for module in targets["rmsnorm"]:
+            originals.append((module, module.forward))
+            module.forward = types.MethodType(_strict_rmsnorm_forward, module)
+        for module in targets["mlp"]:
+            originals.append((module, module.forward))
+            module.forward = types.MethodType(_strict_mlp_forward, module)
+        for module in targets["attention"]:
+            originals.append((module, module.forward))
+            module.forward = types.MethodType(_strict_attention_forward, module)
+
+        if declared is None:
+            talker._faster_qwen3_tts_prefill_compile_compat_declared_mode = mode
+        talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
+        talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = dict(patched)
+        talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = dict(patched)
+        talker._faster_qwen3_tts_prefill_compile_compat_active = True
+        yield prefill_compile_compat_metadata(talker)
+    finally:
+        for module, original_forward in reversed(originals):
+            module.forward = original_forward
+        talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = {}
+        talker._faster_qwen3_tts_prefill_compile_compat_active = False
 
 
 def apply_prefill_compile_compat(talker: Any, mode: str) -> dict[str, Any]:
@@ -218,9 +296,7 @@ def apply_prefill_compile_compat(talker: Any, mode: str) -> dict[str, Any]:
         raise RuntimeError("Talker already has a different prefill compile compatibility mode")
 
     targets = _collect_prefill_compile_compat_targets(talker)
-    patched = {name: len(modules) for name, modules in targets.items()}
-    if patched["rmsnorm"] == 0 or patched["mlp"] == 0 or patched["attention"] == 0:
-        raise RuntimeError(f"Incomplete prefill compile compatibility patch: {patched!r}")
+    patched = _validated_prefill_compile_compat_counts(targets)
 
     for module in targets["rmsnorm"]:
         module.forward = types.MethodType(_strict_rmsnorm_forward, module)
@@ -231,11 +307,13 @@ def apply_prefill_compile_compat(talker: Any, mode: str) -> dict[str, Any]:
 
     talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
     talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = dict(patched)
+    talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = dict(patched)
     return {
         "prefill_compile_compat_mode": mode,
         "prefill_compile_compat_applied": True,
         "prefill_compile_compat_reused": False,
         "prefill_compile_compat_patched_modules": dict(patched),
+        "prefill_compile_compat_validated_modules": dict(patched),
     }
 
 
@@ -250,6 +328,15 @@ def _collect_prefill_compile_compat_targets(talker: Any) -> dict[str, list[Any]]
         elif class_name in {"Qwen3TTSAttention", "Qwen3TTSTalkerAttention"}:
             targets["attention"].append(module)
     return targets
+
+
+def _validated_prefill_compile_compat_counts(
+    targets: dict[str, list[Any]],
+) -> dict[str, int]:
+    patched = {name: len(modules) for name, modules in targets.items()}
+    if patched["rmsnorm"] == 0 or patched["mlp"] == 0 or patched["attention"] == 0:
+        raise RuntimeError(f"Incomplete prefill compile compatibility patch: {patched!r}")
+    return patched
 
 
 def validate_strict_bf16_sdpa_v1(

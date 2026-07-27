@@ -1,8 +1,12 @@
+import sys
+import types
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from faster_qwen3_tts import prefill_compat
+from faster_qwen3_tts.model import FasterQwen3TTS
 
 
 class Qwen3TTSRMSNorm(torch.nn.Module):
@@ -196,20 +200,54 @@ def test_configure_prefill_compile_compat_none_declares_immutable_mode():
 
 def test_configure_prefill_compile_compat_strict_rejects_later_none():
     talker = CompleteTalker()
+    original_attention_forward = talker.attn.forward
     metadata = prefill_compat.configure_prefill_compile_compat(
         talker,
         "strict_bf16_sdpa_v1",
     )
 
-    assert metadata["prefill_compile_compat_applied"] is True
-    assert metadata["prefill_compile_compat_patched_modules"] == {
+    assert metadata["prefill_compile_compat_applied"] is False
+    assert metadata["prefill_compile_compat_patched_modules"] == {}
+    assert metadata["prefill_compile_compat_validated_modules"] == {
         "attention": 1,
         "mlp": 1,
         "rmsnorm": 1,
     }
+    assert talker.attn.forward == original_attention_forward
 
     with pytest.raises(RuntimeError, match="does not match"):
         prefill_compat.ensure_prefill_compile_compat(talker, "none")
+
+
+def test_prefill_compile_compat_context_restores_original_forwards():
+    talker = CompleteTalker()
+    original_attention_forward = talker.attn.forward
+    prefill_compat.configure_prefill_compile_compat(
+        talker,
+        "strict_bf16_sdpa_v1",
+    )
+
+    with prefill_compat.prefill_compile_compat_context(
+        talker,
+        "strict_bf16_sdpa_v1",
+    ) as metadata:
+        assert metadata["prefill_compile_compat_applied"] is True
+        assert metadata["prefill_compile_compat_patched_modules"] == {
+            "attention": 1,
+            "mlp": 1,
+            "rmsnorm": 1,
+        }
+        assert talker.attn.forward != original_attention_forward
+
+    assert talker.attn.forward == original_attention_forward
+    metadata = prefill_compat.prefill_compile_compat_metadata(talker)
+    assert metadata["prefill_compile_compat_applied"] is False
+    assert metadata["prefill_compile_compat_patched_modules"] == {}
+    assert metadata["prefill_compile_compat_validated_modules"] == {
+        "attention": 1,
+        "mlp": 1,
+        "rmsnorm": 1,
+    }
 
 
 def test_legacy_unconfigured_talker_cannot_report_none_after_strict_patch():
@@ -238,3 +276,66 @@ def test_prefill_compile_compat_patch_is_atomic_on_incomplete_talker():
     assert talker.norm.forward == original_norm_forward
     assert talker.mlp.forward == original_mlp_forward
     assert not hasattr(talker, "_faster_qwen3_tts_prefill_compile_compat_mode")
+
+
+def test_from_pretrained_propagates_strict_prefill_compat_metadata(monkeypatch):
+    import faster_qwen3_tts.predictor_graph as predictor_graph_module
+    import faster_qwen3_tts.talker_graph as talker_graph_module
+
+    talker = CompleteTalker()
+    talker.model = torch.nn.Identity()
+    talker.code_predictor = types.SimpleNamespace(
+        model=types.SimpleNamespace(config=types.SimpleNamespace())
+    )
+    base_model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            talker=talker,
+            config=types.SimpleNamespace(
+                talker_config=types.SimpleNamespace(hidden_size=4)
+            ),
+        ),
+    )
+
+    class FakeQwen3TTSModel:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return base_model
+
+    class FakePredictorGraph:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeTalkerGraph:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_tts",
+        types.SimpleNamespace(Qwen3TTSModel=FakeQwen3TTSModel),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(predictor_graph_module, "PredictorGraph", FakePredictorGraph)
+    monkeypatch.setattr(talker_graph_module, "TalkerGraph", FakeTalkerGraph)
+
+    model = FasterQwen3TTS.from_pretrained(
+        "dummy-model",
+        device="cuda",
+        dtype="bfloat16",
+        prefill_compile_compat_mode="strict_bf16_sdpa_v1",
+    )
+
+    assert model.prefill_compile_compat_mode == "strict_bf16_sdpa_v1"
+    metadata = model.prefill_compile_compat_metadata
+    assert metadata["prefill_compile_compat_wrapper_mode"] == "strict_bf16_sdpa_v1"
+    assert metadata["prefill_compile_compat_declared_mode"] == "strict_bf16_sdpa_v1"
+    assert metadata["prefill_compile_compat_mode"] == "strict_bf16_sdpa_v1"
+    assert metadata["prefill_compile_compat_applied"] is False
+    assert metadata["prefill_compile_compat_patched_modules"] == {}
+    assert metadata["prefill_compile_compat_validated_modules"] == {
+        "attention": 1,
+        "mlp": 1,
+        "rmsnorm": 1,
+    }
