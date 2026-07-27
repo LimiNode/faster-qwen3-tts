@@ -14,6 +14,11 @@ import torch
 import torch.nn.functional as F
 
 from .generate import get_eos_tracker, get_fused_codec_embeddings
+from .prefill_compat import (
+    apply_prefill_compile_compat,
+    normalize_prefill_compile_compat_mode,
+    validate_strict_bf16_sdpa_v1,
+)
 from .predictor_graph import PredictorGraph
 from .sampling import apply_repetition_penalty, build_suppress_mask, sample_logits
 from .talker_graph import TalkerGraph
@@ -75,12 +80,25 @@ def _run_talker_prefill(
     *,
     prefill_backend: str,
     prefill_mask_mode: str = "auto",
+    prefill_compile_compat_mode: str = "none",
+    input_metadata: Optional[dict] = None,
 ):
     prefill_backend = _normalize_prefill_backend(prefill_backend)
     prefill_mask_mode = _normalize_prefill_mask_mode(prefill_mask_mode)
+    prefill_compile_compat_mode = normalize_prefill_compile_compat_mode(
+        prefill_compile_compat_mode
+    )
     _validate_prefill_configuration(prefill_backend, prefill_mask_mode)
     skip_prefill_causal_mask = prefill_mask_mode == "skip"
     prefill_attention_mask = None if skip_prefill_causal_mask else attention_mask
+    _validate_prefill_compile_compat_configuration(
+        prefill_backend=prefill_backend,
+        prefill_mask_mode=prefill_mask_mode,
+        prefill_compile_compat_mode=prefill_compile_compat_mode,
+        talker_input_embeds=talker_input_embeds,
+        attention_mask=prefill_attention_mask,
+        input_metadata=input_metadata,
+    )
     profile = {
         "prefill_backend_requested": prefill_backend,
         "prefill_backend_used": "eager",
@@ -88,6 +106,7 @@ def _run_talker_prefill(
         "prefill_compile_error": None,
         "prefill_mask_mode": prefill_mask_mode,
         "prefill_skip_causal_mask": skip_prefill_causal_mask,
+        "prefill_compile_compat_mode": prefill_compile_compat_mode,
     }
     if prefill_backend == "eager":
         return (
@@ -110,6 +129,7 @@ def _run_talker_prefill(
         tts_pad_embed,
         prefill_backend,
         prefill_mask_mode,
+        prefill_compile_compat_mode,
     )
     if cache_key in _PREFILL_COMPILE_ERRORS:
         profile["prefill_compile_fallback"] = True
@@ -127,6 +147,9 @@ def _run_talker_prefill(
         )
 
     try:
+        profile.update(
+            apply_prefill_compile_compat(talker, prefill_compile_compat_mode)
+        )
         compiled = _PREFILL_COMPILE_CACHE.get(cache_key)
         if compiled is None:
             compiled = _compile_talker_prefill(talker, prefill_backend)
@@ -178,6 +201,26 @@ def _validate_prefill_configuration(prefill_backend: str, prefill_mask_mode: str
         raise UnsupportedPrefillConfiguration(
             "Compiled prefill requires verified mask skip; use eager for explicit masks."
         )
+
+
+def _validate_prefill_compile_compat_configuration(
+    *,
+    prefill_backend: str,
+    prefill_mask_mode: str,
+    prefill_compile_compat_mode: str,
+    talker_input_embeds: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    input_metadata: Optional[dict],
+) -> None:
+    if prefill_compile_compat_mode == "none":
+        return
+    validate_strict_bf16_sdpa_v1(
+        prefill_backend=prefill_backend,
+        prefill_mask_mode=prefill_mask_mode,
+        talker_input_embeds=talker_input_embeds,
+        attention_mask=attention_mask,
+        input_metadata=input_metadata,
+    )
 
 
 def select_prefill_mask_mode(input_metadata: Optional[dict]) -> str:
@@ -264,11 +307,13 @@ def _prefill_compile_cache_key(
     tts_pad_embed: torch.Tensor,
     prefill_backend: str,
     prefill_mask_mode: str,
+    prefill_compile_compat_mode: str,
 ) -> tuple:
     return (
         id(talker),
         prefill_backend,
         prefill_mask_mode,
+        prefill_compile_compat_mode,
         _tensor_signature(talker_input_embeds),
         _tensor_signature(attention_mask),
         _tensor_signature(trailing_text_hiddens),
@@ -310,6 +355,7 @@ def fast_generate_streaming(
     profile_nvtx: bool = False,
     prefill_backend: str = "eager",
     prefill_mask_mode: str = "auto",
+    prefill_compile_compat_mode: str = "none",
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -330,6 +376,9 @@ def fast_generate_streaming(
     talker_codec_head = talker.codec_head
     fused_codec_weights, fused_codec_offsets = get_fused_codec_embeddings(predictor)
     prefill_backend = _normalize_prefill_backend(prefill_backend)
+    prefill_compile_compat_mode = normalize_prefill_compile_compat_mode(
+        prefill_compile_compat_mode
+    )
     if str(prefill_mask_mode or "auto").strip().lower() == "auto":
         prefill_mask_mode = select_prefill_mask_mode(input_metadata)
     else:
@@ -359,6 +408,8 @@ def fast_generate_streaming(
             tts_pad_embed,
             prefill_backend=prefill_backend,
             prefill_mask_mode=prefill_mask_mode,
+            prefill_compile_compat_mode=prefill_compile_compat_mode,
+            input_metadata=input_metadata,
         )
     prefill_profile["talker_forward_launch_wall_ms"] = (
         time.perf_counter() - forward_started

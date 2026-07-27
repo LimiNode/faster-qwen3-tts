@@ -367,6 +367,130 @@ def test_fast_generate_streaming_auto_verified_metadata_resolves_skip(monkeypatc
         next(generator)
 
 
+def test_fast_generate_streaming_forwards_prefill_compile_compat_mode(monkeypatch):
+    class ReachedPrefill(RuntimeError):
+        pass
+
+    def capture_prefill(*args, **kwargs):
+        assert kwargs["prefill_backend"] == "compile_reduce_overhead"
+        assert kwargs["prefill_mask_mode"] == "skip"
+        assert kwargs["prefill_compile_compat_mode"] == "strict_bf16_sdpa_v1"
+        assert kwargs["input_metadata"] == _verified_prefill_metadata()
+        raise ReachedPrefill
+
+    monkeypatch.setattr(streaming, "_run_talker_prefill", capture_prefill)
+
+    talker = _dummy_streaming_model()
+    tie, tam, tth, tpe = _dummy_prefill_inputs()
+    generator = streaming.fast_generate_streaming(
+        talker=talker,
+        talker_input_embeds=tie.to(torch.bfloat16),
+        attention_mask=tam,
+        trailing_text_hiddens=tth.to(torch.bfloat16),
+        tts_pad_embed=tpe.to(torch.bfloat16),
+        config=talker.config,
+        predictor_graph=types.SimpleNamespace(),
+        talker_graph=types.SimpleNamespace(),
+        input_metadata=_verified_prefill_metadata(),
+        prefill_backend="compile_reduce_overhead",
+        prefill_mask_mode="auto",
+        prefill_compile_compat_mode="strict_bf16_sdpa_v1",
+    )
+
+    with pytest.raises(ReachedPrefill):
+        next(generator)
+
+
+@pytest.mark.parametrize(
+    "metadata_update, match",
+    [
+        ({"prefill_attn_implementation": "eager"}, "SDPA attention"),
+        ({"prefill_has_sliding_window": True}, "sliding-window"),
+    ],
+)
+def test_run_talker_prefill_rejects_strict_compat_unsafe_metadata(
+    metadata_update,
+    match,
+):
+    metadata = _verified_prefill_metadata()
+    metadata.update(metadata_update)
+    tie, tam, tth, tpe = _dummy_prefill_inputs()
+
+    with pytest.raises(ValueError, match=match):
+        _run_talker_prefill(
+            _dummy_streaming_model(),
+            tie.to(torch.bfloat16),
+            tam,
+            tth.to(torch.bfloat16),
+            tpe.to(torch.bfloat16),
+            prefill_backend="compile_reduce_overhead",
+            prefill_mask_mode="skip",
+            prefill_compile_compat_mode="strict_bf16_sdpa_v1",
+            input_metadata=metadata,
+        )
+
+
+@pytest.mark.parametrize(
+    "prefill_backend, prefill_mask_mode, dtype, batch, match",
+    [
+        ("compile_backend_eager", "skip", torch.bfloat16, 1, "prefill_backend"),
+        ("compile_reduce_overhead", "explicit", torch.bfloat16, 1, "mask skip"),
+        ("compile_reduce_overhead", "skip", torch.float32, 1, "bfloat16"),
+        ("compile_reduce_overhead", "skip", torch.bfloat16, 2, "batch size 1"),
+    ],
+)
+def test_run_talker_prefill_rejects_strict_compat_unsafe_shape_or_backend(
+    prefill_backend,
+    prefill_mask_mode,
+    dtype,
+    batch,
+    match,
+):
+    tie = torch.zeros(batch, 2, 4, dtype=dtype)
+    tam = torch.ones(batch, 2, dtype=torch.long)
+    tth = torch.zeros(batch, 1, 4, dtype=dtype)
+    tpe = torch.zeros(batch, 1, 4, dtype=dtype)
+
+    with pytest.raises((UnsupportedPrefillConfiguration, ValueError), match=match):
+        _run_talker_prefill(
+            _dummy_streaming_model(),
+            tie,
+            tam,
+            tth,
+            tpe,
+            prefill_backend=prefill_backend,
+            prefill_mask_mode=prefill_mask_mode,
+            prefill_compile_compat_mode="strict_bf16_sdpa_v1",
+            input_metadata=_verified_prefill_metadata(),
+        )
+
+
+def test_prefill_compile_cache_key_includes_compat_mode():
+    tie, tam, tth, tpe = _dummy_prefill_inputs()
+    talker = object()
+    base = streaming._prefill_compile_cache_key(
+        talker,
+        tie,
+        None,
+        tth,
+        tpe,
+        "compile_reduce_overhead",
+        "skip",
+        "none",
+    )
+    strict = streaming._prefill_compile_cache_key(
+        talker,
+        tie,
+        None,
+        tth,
+        tpe,
+        "compile_reduce_overhead",
+        "skip",
+        "strict_bf16_sdpa_v1",
+    )
+    assert base != strict
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_generate syncs.")
 def test_min_new_tokens_suppresses_early_eos():
     class DummyConfig:
