@@ -7,6 +7,8 @@ from faster_qwen3_tts.generate import fast_generate
 from faster_qwen3_tts.model import FasterQwen3TTS
 from faster_qwen3_tts.sampling import apply_repetition_penalty
 from faster_qwen3_tts.sampling import sample_logits
+from faster_qwen3_tts.streaming import _run_talker_prefill
+from faster_qwen3_tts.streaming import select_prefill_mask_mode
 
 
 def test_repetition_penalty_uses_all_history():
@@ -54,6 +56,92 @@ def test_faster_wrapper_selects_greedy_predictor_graph():
     model.predictor_graph_greedy = None
     with pytest.raises(RuntimeError, match="Greedy PredictorGraph is unavailable"):
         model._select_predictor_graph(False)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        (
+            {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_batch_size": 1,
+                "prefill_has_sliding_window": False,
+            },
+            "skip",
+        ),
+        (
+            {
+                "prefill_attention_mask_all_valid": False,
+                "prefill_batch_size": 1,
+                "prefill_has_sliding_window": False,
+            },
+            "explicit",
+        ),
+        (
+            {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_batch_size": 2,
+                "prefill_has_sliding_window": False,
+            },
+            "explicit",
+        ),
+        (
+            {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_batch_size": 1,
+                "prefill_has_sliding_window": True,
+            },
+            "explicit",
+        ),
+        (None, "explicit"),
+        ({}, "explicit"),
+    ],
+)
+def test_select_prefill_mask_mode_is_fail_closed(metadata, expected):
+    assert select_prefill_mask_mode(metadata) == expected
+
+
+def test_run_talker_prefill_passes_static_mask_mode():
+    class DummyTalker:
+        def __init__(self):
+            self.seen = []
+
+        def forward(self, **kwargs):
+            self.seen.append(kwargs["skip_prefill_causal_mask"])
+            hidden = kwargs["inputs_embeds"]
+            return types.SimpleNamespace(
+                logits=torch.zeros(1, hidden.shape[1], 3),
+                past_hidden=hidden[:, -1:, :],
+                past_key_values=[],
+                generation_step=0,
+            )
+
+    talker = DummyTalker()
+    tie = torch.zeros(1, 2, 4)
+    tam = torch.ones(1, 2, dtype=torch.long)
+    tth = torch.zeros(1, 1, 4)
+    tpe = torch.zeros(1, 1, 4)
+
+    _run_talker_prefill(
+        talker,
+        tie,
+        tam,
+        tth,
+        tpe,
+        prefill_backend="eager",
+        prefill_mask_mode="skip",
+    )
+    _run_talker_prefill(
+        talker,
+        tie,
+        tam,
+        tth,
+        tpe,
+        prefill_backend="eager",
+        prefill_mask_mode="explicit",
+    )
+
+    assert talker.seen == [True, False]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_generate syncs.")

@@ -8,12 +8,10 @@ CUDA graph usage is identical to non-streaming — same per-step performance.
 
 import math
 import time
-from contextlib import contextmanager
 from typing import Callable, Generator, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-import qwen_tts.core.models.modeling_qwen3_tts as _qwen_modeling
 
 from .generate import get_eos_tracker, get_fused_codec_embeddings
 from .predictor_graph import PredictorGraph
@@ -71,13 +69,17 @@ def _run_talker_prefill(
     tts_pad_embed: torch.Tensor,
     *,
     prefill_backend: str,
+    prefill_mask_mode: str = "auto",
 ):
+    prefill_mask_mode = _normalize_prefill_mask_mode(prefill_mask_mode)
+    skip_prefill_causal_mask = prefill_mask_mode == "skip"
     profile = {
         "prefill_backend_requested": prefill_backend,
         "prefill_backend_used": "eager",
         "prefill_compile_fallback": False,
         "prefill_compile_error": None,
-        "prefill_compile_force_mask_skip": False,
+        "prefill_mask_mode": prefill_mask_mode,
+        "prefill_skip_causal_mask": skip_prefill_causal_mask,
     }
     if prefill_backend == "eager":
         return (
@@ -87,6 +89,7 @@ def _run_talker_prefill(
                 attention_mask,
                 trailing_text_hiddens,
                 tts_pad_embed,
+                skip_prefill_causal_mask=skip_prefill_causal_mask,
             ),
             profile,
         )
@@ -98,6 +101,7 @@ def _run_talker_prefill(
         trailing_text_hiddens,
         tts_pad_embed,
         prefill_backend,
+        prefill_mask_mode,
     )
     if cache_key in _PREFILL_COMPILE_ERRORS:
         profile["prefill_compile_fallback"] = True
@@ -109,6 +113,7 @@ def _run_talker_prefill(
                 attention_mask,
                 trailing_text_hiddens,
                 tts_pad_embed,
+                skip_prefill_causal_mask=skip_prefill_causal_mask,
             ),
             profile,
         )
@@ -118,14 +123,13 @@ def _run_talker_prefill(
         if compiled is None:
             compiled = _compile_talker_prefill(talker, prefill_backend)
             _PREFILL_COMPILE_CACHE[cache_key] = compiled
-        force_mask_skip = _can_skip_prefill_mask(talker, attention_mask)
-        with _force_qwen_prefill_mask_skip(force_mask_skip):
-            out = compiled(
-                talker_input_embeds,
-                attention_mask,
-                trailing_text_hiddens,
-                tts_pad_embed,
-            )
+        out = compiled(
+            talker_input_embeds,
+            attention_mask,
+            trailing_text_hiddens,
+            tts_pad_embed,
+            skip_prefill_causal_mask,
+        )
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         _PREFILL_COMPILE_ERRORS[cache_key] = message
@@ -138,40 +142,37 @@ def _run_talker_prefill(
                 attention_mask,
                 trailing_text_hiddens,
                 tts_pad_embed,
+                skip_prefill_causal_mask=skip_prefill_causal_mask,
             ),
             profile,
         )
 
     profile["prefill_backend_used"] = prefill_backend
-    profile["prefill_compile_force_mask_skip"] = force_mask_skip
     return out, profile
 
 
-@contextmanager
-def _force_qwen_prefill_mask_skip(enabled: bool):
-    if not enabled:
-        yield
-        return
-    original = _qwen_modeling.create_causal_mask
-    _qwen_modeling.create_causal_mask = _return_no_causal_mask
-    try:
-        yield
-    finally:
-        _qwen_modeling.create_causal_mask = original
+def _normalize_prefill_mask_mode(prefill_mask_mode: str) -> str:
+    mode = str(prefill_mask_mode or "auto").strip().lower()
+    if mode not in {"auto", "skip", "explicit"}:
+        raise ValueError(
+            f"Unsupported prefill_mask_mode {prefill_mask_mode!r}. "
+            "Expected 'auto', 'skip', or 'explicit'."
+        )
+    if mode == "auto":
+        return "explicit"
+    return mode
 
 
-def _return_no_causal_mask(**kwargs):
-    return None
-
-
-def _can_skip_prefill_mask(talker, attention_mask: torch.Tensor) -> bool:
-    model = getattr(talker, "model", None)
-    config = getattr(model, "config", None)
-    if getattr(config, "sliding_window", None) is not None:
-        return False
-    if attention_mask is None:
-        return True
-    return bool(attention_mask.detach().bool().all().item())
+def select_prefill_mask_mode(input_metadata: Optional[dict]) -> str:
+    if not input_metadata:
+        return "explicit"
+    if input_metadata.get("prefill_attention_mask_all_valid") is not True:
+        return "explicit"
+    if input_metadata.get("prefill_batch_size") != 1:
+        return "explicit"
+    if input_metadata.get("prefill_has_sliding_window") is True:
+        return "explicit"
+    return "skip"
 
 
 def _talker_prefill_eager(
@@ -180,6 +181,8 @@ def _talker_prefill_eager(
     attention_mask: torch.Tensor,
     trailing_text_hiddens: torch.Tensor,
     tts_pad_embed: torch.Tensor,
+    *,
+    skip_prefill_causal_mask: bool = False,
 ):
     return talker.forward(
         inputs_embeds=talker_input_embeds,
@@ -192,6 +195,7 @@ def _talker_prefill_eager(
         generation_step=None,
         past_hidden=None,
         past_key_values=None,
+        skip_prefill_causal_mask=skip_prefill_causal_mask,
     )
 
 
@@ -210,6 +214,7 @@ def _compile_talker_prefill(talker, prefill_backend: str) -> Callable:
         attention_mask: torch.Tensor,
         trailing_text_hiddens: torch.Tensor,
         tts_pad_embed: torch.Tensor,
+        skip_prefill_causal_mask: bool,
     ):
         return _talker_prefill_eager(
             talker,
@@ -217,6 +222,7 @@ def _compile_talker_prefill(talker, prefill_backend: str) -> Callable:
             attention_mask,
             trailing_text_hiddens,
             tts_pad_embed,
+            skip_prefill_causal_mask=skip_prefill_causal_mask,
         )
 
     return torch.compile(
@@ -235,10 +241,12 @@ def _prefill_compile_cache_key(
     trailing_text_hiddens: torch.Tensor,
     tts_pad_embed: torch.Tensor,
     prefill_backend: str,
+    prefill_mask_mode: str,
 ) -> tuple:
     return (
         id(talker),
         prefill_backend,
+        prefill_mask_mode,
         _tensor_signature(talker_input_embeds),
         _tensor_signature(attention_mask),
         _tensor_signature(trailing_text_hiddens),
@@ -297,6 +305,7 @@ def fast_generate_streaming(
     talker_codec_head = talker.codec_head
     fused_codec_weights, fused_codec_offsets = get_fused_codec_embeddings(predictor)
     prefill_backend = _normalize_prefill_backend(prefill_backend)
+    prefill_mask_mode = select_prefill_mask_mode(input_metadata)
 
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.perf_counter()
@@ -320,6 +329,7 @@ def fast_generate_streaming(
             trailing_text_hiddens,
             tts_pad_embed,
             prefill_backend=prefill_backend,
+            prefill_mask_mode=prefill_mask_mode,
         )
     prefill_profile["talker_forward_launch_wall_ms"] = (
         time.perf_counter() - forward_started

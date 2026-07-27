@@ -639,6 +639,11 @@ class FasterQwen3TTS:
                     int(instruct_id.shape[-1]) if instruct_id is not None else 0
                 ),
                 "talker_prefill_length": int(tie.shape[1]),
+                "prefill_batch_size": int(tie.shape[0]),
+                "prefill_attention_mask_all_valid": True,
+                "prefill_has_sliding_window": bool(
+                    getattr(config, "sliding_window", None) is not None
+                ),
                 "tokenize_wall_ms": tokenize_wall_ms,
                 "build_talker_inputs_wall_ms": build_talker_inputs_wall_ms,
             }
