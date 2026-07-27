@@ -73,6 +73,7 @@ def _run_talker_prefill(
 ):
     prefill_mask_mode = _normalize_prefill_mask_mode(prefill_mask_mode)
     skip_prefill_causal_mask = prefill_mask_mode == "skip"
+    prefill_attention_mask = None if skip_prefill_causal_mask else attention_mask
     profile = {
         "prefill_backend_requested": prefill_backend,
         "prefill_backend_used": "eager",
@@ -86,7 +87,7 @@ def _run_talker_prefill(
             _talker_prefill_eager(
                 talker,
                 talker_input_embeds,
-                attention_mask,
+                prefill_attention_mask,
                 trailing_text_hiddens,
                 tts_pad_embed,
                 skip_prefill_causal_mask=skip_prefill_causal_mask,
@@ -97,7 +98,7 @@ def _run_talker_prefill(
     cache_key = _prefill_compile_cache_key(
         talker,
         talker_input_embeds,
-        attention_mask,
+        prefill_attention_mask,
         trailing_text_hiddens,
         tts_pad_embed,
         prefill_backend,
@@ -110,7 +111,7 @@ def _run_talker_prefill(
             _talker_prefill_eager(
                 talker,
                 talker_input_embeds,
-                attention_mask,
+                prefill_attention_mask,
                 trailing_text_hiddens,
                 tts_pad_embed,
                 skip_prefill_causal_mask=skip_prefill_causal_mask,
@@ -125,7 +126,7 @@ def _run_talker_prefill(
             _PREFILL_COMPILE_CACHE[cache_key] = compiled
         out = compiled(
             talker_input_embeds,
-            attention_mask,
+            prefill_attention_mask,
             trailing_text_hiddens,
             tts_pad_embed,
             skip_prefill_causal_mask,
@@ -139,7 +140,7 @@ def _run_talker_prefill(
             _talker_prefill_eager(
                 talker,
                 talker_input_embeds,
-                attention_mask,
+                prefill_attention_mask,
                 trailing_text_hiddens,
                 tts_pad_embed,
                 skip_prefill_causal_mask=skip_prefill_causal_mask,
@@ -182,7 +183,7 @@ def select_prefill_mask_mode(input_metadata: Optional[dict]) -> str:
 def _talker_prefill_eager(
     talker,
     talker_input_embeds: torch.Tensor,
-    attention_mask: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
     trailing_text_hiddens: torch.Tensor,
     tts_pad_embed: torch.Tensor,
     *,
@@ -215,7 +216,7 @@ def _compile_talker_prefill(talker, prefill_backend: str) -> Callable:
 
     def prefill_fn(
         inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
         trailing_text_hiddens: torch.Tensor,
         tts_pad_embed: torch.Tensor,
         skip_prefill_causal_mask: bool,
@@ -258,7 +259,9 @@ def _prefill_compile_cache_key(
     )
 
 
-def _tensor_signature(tensor: torch.Tensor) -> tuple:
+def _tensor_signature(tensor: Optional[torch.Tensor]) -> tuple:
+    if tensor is None:
+        return ("none",)
     return (
         tuple(tensor.shape),
         str(tensor.dtype),
@@ -289,6 +292,7 @@ def fast_generate_streaming(
     profile_prefill: bool = False,
     profile_nvtx: bool = False,
     prefill_backend: str = "eager",
+    prefill_mask_mode: str = "auto",
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -309,7 +313,8 @@ def fast_generate_streaming(
     talker_codec_head = talker.codec_head
     fused_codec_weights, fused_codec_offsets = get_fused_codec_embeddings(predictor)
     prefill_backend = _normalize_prefill_backend(prefill_backend)
-    prefill_mask_mode = select_prefill_mask_mode(input_metadata)
+    if str(prefill_mask_mode or "auto").strip().lower() == "auto":
+        prefill_mask_mode = select_prefill_mask_mode(input_metadata)
 
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.perf_counter()

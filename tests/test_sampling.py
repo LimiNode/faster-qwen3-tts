@@ -157,9 +157,11 @@ def test_run_talker_prefill_passes_static_mask_mode():
     class DummyTalker:
         def __init__(self):
             self.seen = []
+            self.masks = []
 
         def forward(self, **kwargs):
             self.seen.append(kwargs["skip_prefill_causal_mask"])
+            self.masks.append(kwargs["attention_mask"])
             hidden = kwargs["inputs_embeds"]
             return types.SimpleNamespace(
                 logits=torch.zeros(1, hidden.shape[1], 3),
@@ -194,6 +196,8 @@ def test_run_talker_prefill_passes_static_mask_mode():
     )
 
     assert talker.seen == [True, False]
+    assert talker.masks[0] is None
+    assert talker.masks[1] is tam
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_generate syncs.")

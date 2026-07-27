@@ -635,7 +635,7 @@ class FasterQwen3TTS:
 
         m = self.model.model
         build_started = time.perf_counter()
-        tie, tam, tth, tpe = self._build_talker_inputs_local(
+        tie, tam, tth, tpe, mask_metadata = self._build_talker_inputs_local(
             m=m,
             input_ids=input_ids,
             ref_ids=[None],
@@ -644,6 +644,7 @@ class FasterQwen3TTS:
             speakers=[speaker],
             non_streaming_mode=non_streaming_mode,
             instruct_ids=instruct_ids,
+            return_mask_metadata=True,
         )
         build_talker_inputs_wall_ms = (time.perf_counter() - build_started) * 1000
 
@@ -657,9 +658,6 @@ class FasterQwen3TTS:
 
         if return_metadata:
             instruct_id = instruct_ids[0] if instruct_ids else None
-            mask_metadata = self._prefill_attention_mask_metadata(
-                torch.tensor([int(tie.shape[1])], dtype=torch.long)
-            )
             metadata = {
                 "text_token_count": int(input_ids[0].shape[-1]) if input_ids else 0,
                 "instruction_token_count": (
@@ -691,6 +689,7 @@ class FasterQwen3TTS:
         speakers,
         non_streaming_mode: bool,
         instruct_ids=None,
+        return_mask_metadata: bool = False,
     ):
         """Local copy of upstream talker input building for qwen-tts main repo."""
         talker_input_embeds = [[] for _ in range(len(input_ids))]
@@ -941,6 +940,7 @@ class FasterQwen3TTS:
         talker_attention_mask = (
             (indices >= num_pads.unsqueeze(1)).long().to(talker_input_embeds.device)
         )
+        mask_metadata = self._prefill_attention_mask_metadata(original_lengths)
 
         pad_embedding_vector = tts_pad_embed.squeeze()
         sequences_to_pad = [t.squeeze(0) for t in trailing_text_hiddens]
@@ -960,12 +960,15 @@ class FasterQwen3TTS:
         padded_hiddens[padding_mask] = pad_embedding_vector
         trailing_text_hiddens = padded_hiddens
 
-        return (
+        result = (
             talker_input_embeds,
             talker_attention_mask,
             trailing_text_hiddens,
             tts_pad_embed,
         )
+        if return_mask_metadata:
+            return (*result, mask_metadata)
+        return result
 
     @torch.inference_mode()
     def generate_voice_clone(
