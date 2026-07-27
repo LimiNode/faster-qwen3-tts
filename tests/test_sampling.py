@@ -61,6 +61,19 @@ def test_faster_wrapper_selects_greedy_predictor_graph():
         model._select_predictor_graph(False)
 
 
+def test_faster_wrapper_uses_loaded_prefill_compile_compat_mode_by_default():
+    model = FasterQwen3TTS.__new__(FasterQwen3TTS)
+    model.prefill_compile_compat_mode = "strict_bf16_sdpa_v1"
+
+    assert model._resolve_prefill_compile_compat_mode(None) == "strict_bf16_sdpa_v1"
+    assert (
+        model._resolve_prefill_compile_compat_mode("strict_bf16_sdpa_v1")
+        == "strict_bf16_sdpa_v1"
+    )
+    with pytest.raises(RuntimeError, match="immutable"):
+        model._resolve_prefill_compile_compat_mode("none")
+
+
 @pytest.mark.parametrize(
     ("metadata", "expected"),
     [

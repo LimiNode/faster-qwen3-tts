@@ -14,6 +14,10 @@ import numpy as np
 import soundfile as sf
 import torch
 
+from .prefill_compat import (
+    configure_prefill_compile_compat,
+    normalize_prefill_compile_compat_mode,
+)
 from .utils import suppress_flash_attn_warning
 
 logger = logging.getLogger(__name__)
@@ -36,6 +40,7 @@ class FasterQwen3TTS:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         max_seq_len: int = 2048,
+        prefill_compile_compat_mode: Optional[str] = "none",
     ):
         self.model = base_model  # The qwen-tts Qwen3TTSModel instance
         self.predictor_graph = predictor_graph
@@ -44,6 +49,11 @@ class FasterQwen3TTS:
         self.device = device
         self.dtype = dtype
         self.max_seq_len = max_seq_len
+        self.prefill_compile_compat_mode = (
+            normalize_prefill_compile_compat_mode(prefill_compile_compat_mode)
+            if prefill_compile_compat_mode is not None
+            else "none"
+        )
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
         self._voice_prompt_cache = {}  # Cache (ref_audio, ref_text) -> (vcp, ref_ids)
@@ -122,6 +132,18 @@ class FasterQwen3TTS:
             raise RuntimeError("Greedy PredictorGraph is unavailable for do_sample=False")
         return self.predictor_graph_greedy
 
+    def _resolve_prefill_compile_compat_mode(self, requested_mode: Optional[str]) -> str:
+        if requested_mode is None:
+            return self.prefill_compile_compat_mode
+        requested_mode = normalize_prefill_compile_compat_mode(requested_mode)
+        if requested_mode != self.prefill_compile_compat_mode:
+            raise RuntimeError(
+                "prefill_compile_compat_mode is immutable for a loaded model: "
+                f"requested {requested_mode!r}, loaded "
+                f"{self.prefill_compile_compat_mode!r}."
+            )
+        return requested_mode
+
     @staticmethod
     def _reject_ggml_cached_reference_args(
         ref_spk: Optional[Union[str, Path]],
@@ -155,6 +177,7 @@ class FasterQwen3TTS:
         qwentts_ref_cache_dir: Optional[Union[str, Path]] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         local_files_only: bool = False,
+        prefill_compile_compat_mode: Optional[str] = "none",
     ):
         """
         Load Qwen3-TTS model and prepare CUDA graphs.
@@ -180,12 +203,21 @@ class FasterQwen3TTS:
             A backend-specific model implementing the public generation and
             warmup APIs.
         """
+        normalized_prefill_compile_compat_mode = (
+            normalize_prefill_compile_compat_mode(prefill_compile_compat_mode)
+            if prefill_compile_compat_mode is not None
+            else None
+        )
         if backend not in ("torch", "ggml", "qwentts"):
             raise ValueError(
                 f"Unsupported backend {backend!r}. Expected 'torch', 'ggml', or 'qwentts'."
             )
 
         if backend in ("ggml", "qwentts"):
+            if normalized_prefill_compile_compat_mode not in (None, "none"):
+                raise ValueError(
+                    "prefill_compile_compat_mode is only supported by backend='torch'"
+                )
             from .ggml_backend import GGMLQwen3TTS
 
             if gguf_talker_path is not None or gguf_codec_path is not None:
@@ -236,6 +268,11 @@ class FasterQwen3TTS:
         )
 
         talker = base_model.model.talker
+        if normalized_prefill_compile_compat_mode is not None:
+            configure_prefill_compile_compat(
+                talker,
+                normalized_prefill_compile_compat_mode,
+            )
         talker_config = base_model.model.config.talker_config
 
         # Extract predictor config from loaded model
@@ -1414,10 +1451,13 @@ class FasterQwen3TTS:
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
         prefill_backend: str = "eager",
-        prefill_compile_compat_mode: str = "none",
+        prefill_compile_compat_mode: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "custom_voice":
             raise ValueError("Loaded model does not support custom voice generation")
+        prefill_compile_compat_mode = self._resolve_prefill_compile_compat_mode(
+            prefill_compile_compat_mode
+        )
 
         self.model._validate_languages([language])
         self.model._validate_speakers([speaker])
@@ -1618,10 +1658,13 @@ class FasterQwen3TTS:
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
         prefill_backend: str = "eager",
-        prefill_compile_compat_mode: str = "none",
+        prefill_compile_compat_mode: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "voice_design":
             raise ValueError("Loaded model does not support voice design generation")
+        prefill_compile_compat_mode = self._resolve_prefill_compile_compat_mode(
+            prefill_compile_compat_mode
+        )
 
         self.model._validate_languages([language])
 

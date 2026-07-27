@@ -5,6 +5,62 @@ import torch.nn.functional as F
 from faster_qwen3_tts import prefill_compat
 
 
+class Qwen3TTSRMSNorm(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(4))
+        self.variance_epsilon = 1.0e-6
+
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class Qwen3TTSTalkerTextMLP(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = torch.nn.Linear(4, 4)
+        self.up_proj = torch.nn.Linear(4, 4)
+        self.down_proj = torch.nn.Linear(4, 4)
+        self.act_fn = torch.nn.SiLU()
+
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class Qwen3TTSTalkerAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = torch.nn.Linear(4, 4)
+        self.k_proj = torch.nn.Linear(4, 4)
+        self.v_proj = torch.nn.Linear(4, 4)
+        self.o_proj = torch.nn.Linear(4, 4)
+        self.q_norm = torch.nn.Identity()
+        self.k_norm = torch.nn.Identity()
+        self.head_dim = 4
+        self.scaling = 0.5
+        self.num_key_value_groups = 1
+        self.layer_idx = 0
+        self.is_causal = True
+
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class CompleteTalker(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = Qwen3TTSRMSNorm()
+        self.mlp = Qwen3TTSTalkerTextMLP()
+        self.attn = Qwen3TTSTalkerAttention()
+
+
+class PartialTalker(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = Qwen3TTSRMSNorm()
+        self.mlp = Qwen3TTSTalkerTextMLP()
+
+
 def test_strict_add_matches_torch_add():
     left = torch.randn(2, 3, dtype=torch.float32)
     right = torch.randn(2, 3, dtype=torch.float32)
@@ -118,3 +174,67 @@ def test_strict_sdpa_cuda_bf16_gqa_layout():
     assert output.shape == (1, 7, 4, 16)
     assert output.dtype is torch.bfloat16
     assert output.is_contiguous()
+
+
+def test_configure_prefill_compile_compat_none_declares_immutable_mode():
+    talker = CompleteTalker()
+    metadata = prefill_compat.configure_prefill_compile_compat(talker, "none")
+
+    assert metadata["prefill_compile_compat_mode"] == "none"
+    assert metadata["prefill_compile_compat_applied"] is False
+    assert (
+        talker._faster_qwen3_tts_prefill_compile_compat_declared_mode
+        == "none"
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        prefill_compat.ensure_prefill_compile_compat(
+            talker,
+            "strict_bf16_sdpa_v1",
+        )
+
+
+def test_configure_prefill_compile_compat_strict_rejects_later_none():
+    talker = CompleteTalker()
+    metadata = prefill_compat.configure_prefill_compile_compat(
+        talker,
+        "strict_bf16_sdpa_v1",
+    )
+
+    assert metadata["prefill_compile_compat_applied"] is True
+    assert metadata["prefill_compile_compat_patched_modules"] == {
+        "attention": 1,
+        "mlp": 1,
+        "rmsnorm": 1,
+    }
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        prefill_compat.ensure_prefill_compile_compat(talker, "none")
+
+
+def test_legacy_unconfigured_talker_cannot_report_none_after_strict_patch():
+    talker = CompleteTalker()
+
+    prefill_compat.ensure_prefill_compile_compat(
+        talker,
+        "strict_bf16_sdpa_v1",
+    )
+
+    with pytest.raises(RuntimeError, match="different"):
+        prefill_compat.ensure_prefill_compile_compat(talker, "none")
+
+
+def test_prefill_compile_compat_patch_is_atomic_on_incomplete_talker():
+    talker = PartialTalker()
+    original_norm_forward = talker.norm.forward
+    original_mlp_forward = talker.mlp.forward
+
+    with pytest.raises(RuntimeError, match="Incomplete"):
+        prefill_compat.apply_prefill_compile_compat(
+            talker,
+            "strict_bf16_sdpa_v1",
+        )
+
+    assert talker.norm.forward == original_norm_forward
+    assert talker.mlp.forward == original_mlp_forward
+    assert not hasattr(talker, "_faster_qwen3_tts_prefill_compile_compat_mode")

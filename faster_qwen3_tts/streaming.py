@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from .generate import get_eos_tracker, get_fused_codec_embeddings
 from .prefill_compat import (
-    apply_prefill_compile_compat,
+    ensure_prefill_compile_compat,
     normalize_prefill_compile_compat_mode,
     validate_strict_bf16_sdpa_v1,
 )
@@ -148,7 +148,7 @@ def _run_talker_prefill(
 
     try:
         profile.update(
-            apply_prefill_compile_compat(talker, prefill_compile_compat_mode)
+            ensure_prefill_compile_compat(talker, prefill_compile_compat_mode)
         )
         compiled = _PREFILL_COMPILE_CACHE.get(cache_key)
         if compiled is None:
