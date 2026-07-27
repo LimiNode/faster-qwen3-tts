@@ -84,6 +84,28 @@ class FasterQwen3TTS:
         return int(sample_rate)
 
     @staticmethod
+    def _prefill_attention_mask_metadata(original_lengths: torch.Tensor) -> Dict[str, Any]:
+        """Describe whether the locally constructed prefill mask is all-valid."""
+        if original_lengths.ndim != 1 or original_lengths.numel() == 0:
+            return {
+                "prefill_attention_mask_all_valid": False,
+                "prefill_mask_decision_source": "unknown",
+            }
+
+        lengths = original_lengths.detach().cpu()
+        max_len = int(lengths.max().item())
+        min_len = int(lengths.min().item())
+        if min_len == max_len:
+            return {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_mask_decision_source": "constructed_all_ones",
+            }
+        return {
+            "prefill_attention_mask_all_valid": False,
+            "prefill_mask_decision_source": "constructed_left_padded",
+        }
+
+    @staticmethod
     def _resolve_non_streaming_mode(
         non_streaming_mode: Optional[bool],
         *,
@@ -577,6 +599,7 @@ class FasterQwen3TTS:
 
         talker = m.talker
         config = m.config.talker_config
+        talker_model_config = getattr(getattr(talker, "model", None), "config", config)
         talker.rope_deltas = None
 
         # For ICL mode: return ref_codes so the decoder can use them as acoustic context
@@ -629,10 +652,14 @@ class FasterQwen3TTS:
 
         talker = m.talker
         config = m.config.talker_config
+        talker_model_config = getattr(getattr(talker, "model", None), "config", config)
         talker.rope_deltas = None
 
         if return_metadata:
             instruct_id = instruct_ids[0] if instruct_ids else None
+            mask_metadata = self._prefill_attention_mask_metadata(
+                torch.tensor([int(tie.shape[1])], dtype=torch.long)
+            )
             metadata = {
                 "text_token_count": int(input_ids[0].shape[-1]) if input_ids else 0,
                 "instruction_token_count": (
@@ -640,9 +667,12 @@ class FasterQwen3TTS:
                 ),
                 "talker_prefill_length": int(tie.shape[1]),
                 "prefill_batch_size": int(tie.shape[0]),
-                "prefill_attention_mask_all_valid": True,
+                **mask_metadata,
                 "prefill_has_sliding_window": bool(
-                    getattr(config, "sliding_window", None) is not None
+                    getattr(talker_model_config, "sliding_window", None) is not None
+                ),
+                "prefill_attn_implementation": getattr(
+                    talker_model_config, "_attn_implementation", "eager"
                 ),
                 "tokenize_wall_ms": tokenize_wall_ms,
                 "build_talker_inputs_wall_ms": build_talker_inputs_wall_ms,

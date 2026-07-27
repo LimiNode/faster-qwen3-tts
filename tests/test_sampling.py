@@ -64,32 +64,69 @@ def test_faster_wrapper_selects_greedy_predictor_graph():
         (
             {
                 "prefill_attention_mask_all_valid": True,
+                "prefill_mask_decision_source": "constructed_all_ones",
                 "prefill_batch_size": 1,
                 "prefill_has_sliding_window": False,
+                "prefill_attn_implementation": "eager",
             },
             "skip",
         ),
         (
             {
                 "prefill_attention_mask_all_valid": False,
+                "prefill_mask_decision_source": "constructed_left_padded",
                 "prefill_batch_size": 1,
                 "prefill_has_sliding_window": False,
+                "prefill_attn_implementation": "eager",
             },
             "explicit",
         ),
         (
             {
                 "prefill_attention_mask_all_valid": True,
+                "prefill_batch_size": 1,
+                "prefill_has_sliding_window": False,
+                "prefill_attn_implementation": "eager",
+            },
+            "explicit",
+        ),
+        (
+            {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_mask_decision_source": "constructed_all_ones",
                 "prefill_batch_size": 2,
                 "prefill_has_sliding_window": False,
+                "prefill_attn_implementation": "eager",
             },
             "explicit",
         ),
         (
             {
                 "prefill_attention_mask_all_valid": True,
+                "prefill_mask_decision_source": "constructed_all_ones",
                 "prefill_batch_size": 1,
                 "prefill_has_sliding_window": True,
+                "prefill_attn_implementation": "eager",
+            },
+            "explicit",
+        ),
+        (
+            {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_mask_decision_source": "constructed_all_ones",
+                "prefill_batch_size": 1,
+                "prefill_has_sliding_window": False,
+                "prefill_attn_implementation": "sdpa",
+            },
+            "skip",
+        ),
+        (
+            {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_mask_decision_source": "constructed_all_ones",
+                "prefill_batch_size": 1,
+                "prefill_has_sliding_window": False,
+                "prefill_attn_implementation": "flash_attention_2",
             },
             "explicit",
         ),
@@ -99,6 +136,21 @@ def test_faster_wrapper_selects_greedy_predictor_graph():
 )
 def test_select_prefill_mask_mode_is_fail_closed(metadata, expected):
     assert select_prefill_mask_mode(metadata) == expected
+
+
+def test_prefill_attention_mask_metadata_tracks_local_provenance():
+    assert FasterQwen3TTS._prefill_attention_mask_metadata(torch.tensor([8])) == {
+        "prefill_attention_mask_all_valid": True,
+        "prefill_mask_decision_source": "constructed_all_ones",
+    }
+    assert FasterQwen3TTS._prefill_attention_mask_metadata(torch.tensor([5, 8])) == {
+        "prefill_attention_mask_all_valid": False,
+        "prefill_mask_decision_source": "constructed_left_padded",
+    }
+    assert FasterQwen3TTS._prefill_attention_mask_metadata(torch.tensor([])) == {
+        "prefill_attention_mask_all_valid": False,
+        "prefill_mask_decision_source": "unknown",
+    }
 
 
 def test_run_talker_prefill_passes_static_mask_mode():

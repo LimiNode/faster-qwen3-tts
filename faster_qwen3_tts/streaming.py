@@ -168,9 +168,13 @@ def select_prefill_mask_mode(input_metadata: Optional[dict]) -> str:
         return "explicit"
     if input_metadata.get("prefill_attention_mask_all_valid") is not True:
         return "explicit"
+    if input_metadata.get("prefill_mask_decision_source") != "constructed_all_ones":
+        return "explicit"
     if input_metadata.get("prefill_batch_size") != 1:
         return "explicit"
     if input_metadata.get("prefill_has_sliding_window") is True:
+        return "explicit"
+    if input_metadata.get("prefill_attn_implementation") not in {"eager", "sdpa"}:
         return "explicit"
     return "skip"
 
