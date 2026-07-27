@@ -8,6 +8,7 @@ from faster_qwen3_tts.model import FasterQwen3TTS
 from faster_qwen3_tts.sampling import apply_repetition_penalty
 from faster_qwen3_tts.sampling import sample_logits
 from faster_qwen3_tts.streaming import _run_talker_prefill
+from faster_qwen3_tts.streaming import UnsupportedPrefillConfiguration
 from faster_qwen3_tts.streaming import select_prefill_mask_mode
 
 
@@ -198,6 +199,55 @@ def test_run_talker_prefill_passes_static_mask_mode():
     assert talker.seen == [True, False]
     assert talker.masks[0] is None
     assert talker.masks[1] is tam
+
+
+def test_run_talker_prefill_rejects_compiled_explicit_masks():
+    class DummyTalker:
+        def forward(self, **kwargs):
+            hidden = kwargs["inputs_embeds"]
+            return types.SimpleNamespace(
+                logits=torch.zeros(1, hidden.shape[1], 3),
+                past_hidden=hidden[:, -1:, :],
+                past_key_values=[],
+                generation_step=0,
+            )
+
+    talker = DummyTalker()
+    tie = torch.zeros(1, 2, 4)
+    tam = torch.ones(1, 2, dtype=torch.long)
+    tth = torch.zeros(1, 1, 4)
+    tpe = torch.zeros(1, 1, 4)
+
+    _run_talker_prefill(
+        talker,
+        tie,
+        tam,
+        tth,
+        tpe,
+        prefill_backend="eager",
+        prefill_mask_mode="explicit",
+    )
+
+    with pytest.raises(UnsupportedPrefillConfiguration):
+        _run_talker_prefill(
+            talker,
+            tie,
+            tam,
+            tth,
+            tpe,
+            prefill_backend="compile_backend_eager",
+            prefill_mask_mode="explicit",
+        )
+
+    _run_talker_prefill(
+        talker,
+        tie,
+        tam,
+        tth,
+        tpe,
+        prefill_backend="compile_backend_eager",
+        prefill_mask_mode="skip",
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_generate syncs.")

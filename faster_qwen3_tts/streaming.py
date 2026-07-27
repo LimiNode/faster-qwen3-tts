@@ -35,6 +35,10 @@ _PREFILL_COMPILE_CACHE = {}
 _PREFILL_COMPILE_ERRORS = {}
 
 
+class UnsupportedPrefillConfiguration(ValueError):
+    """Raised when a requested prefill backend/mask combination is unsafe."""
+
+
 class _CudaNvtxRange:
     def __init__(self, name: str, enabled: bool):
         self._name = name
@@ -72,7 +76,9 @@ def _run_talker_prefill(
     prefill_backend: str,
     prefill_mask_mode: str = "auto",
 ):
+    prefill_backend = _normalize_prefill_backend(prefill_backend)
     prefill_mask_mode = _normalize_prefill_mask_mode(prefill_mask_mode)
+    _validate_prefill_configuration(prefill_backend, prefill_mask_mode)
     skip_prefill_causal_mask = prefill_mask_mode == "skip"
     prefill_attention_mask = None if skip_prefill_causal_mask else attention_mask
     profile = {
@@ -163,6 +169,15 @@ def _normalize_prefill_mask_mode(prefill_mask_mode: str) -> str:
     if mode == "auto":
         return "explicit"
     return mode
+
+
+def _validate_prefill_configuration(prefill_backend: str, prefill_mask_mode: str) -> None:
+    if prefill_backend == "eager":
+        return
+    if prefill_mask_mode != "skip":
+        raise UnsupportedPrefillConfiguration(
+            "Compiled prefill requires verified mask skip; use eager for explicit masks."
+        )
 
 
 def select_prefill_mask_mode(input_metadata: Optional[dict]) -> str:
@@ -317,6 +332,9 @@ def fast_generate_streaming(
     prefill_backend = _normalize_prefill_backend(prefill_backend)
     if str(prefill_mask_mode or "auto").strip().lower() == "auto":
         prefill_mask_mode = select_prefill_mask_mode(input_metadata)
+    else:
+        prefill_mask_mode = _normalize_prefill_mask_mode(prefill_mask_mode)
+    _validate_prefill_configuration(prefill_backend, prefill_mask_mode)
 
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.perf_counter()
