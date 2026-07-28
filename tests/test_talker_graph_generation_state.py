@@ -9,9 +9,8 @@ from faster_qwen3_tts.talker_graph import TalkerGraph
 class TalkerGraphGenerationStateTests(unittest.TestCase):
     def test_none_then_verified_all_valid_reuses_mask_table(self) -> None:
         graph = _graph_with_mask_table(mask_key=None)
-        mask = torch.ones(1, 32, dtype=torch.long)
 
-        graph.set_generation_state(mask, None, attention_mask_all_valid=True)
+        graph.set_generation_state(None, None, attention_mask_all_valid=True)
 
         self.assertEqual([], graph._build_calls)
         self.assertIsNone(graph._mask_key)
@@ -23,6 +22,16 @@ class TalkerGraphGenerationStateTests(unittest.TestCase):
                 "generation_state_attention_mask_all_valid"
             ]
         )
+
+    def test_verified_all_valid_rejects_contradictory_mask(self) -> None:
+        graph = _graph_with_mask_table(mask_key=None)
+
+        with self.assertRaisesRegex(ValueError, "attention_mask=None"):
+            graph.set_generation_state(
+                torch.ones(1, 32, dtype=torch.long),
+                None,
+                attention_mask_all_valid=True,
+            )
 
     def test_repeated_all_valid_reuses_mask_table(self) -> None:
         graph = _graph_with_mask_table(mask_key=None)

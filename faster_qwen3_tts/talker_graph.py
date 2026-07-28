@@ -188,6 +188,10 @@ class TalkerGraph:
         attention_mask_all_valid: bool = False,
     ):
         """Set padding-aware attention mask and rope deltas for decode parity."""
+        if attention_mask_all_valid and attention_mask is not None:
+            raise ValueError(
+                "verified all-valid generation state must use attention_mask=None"
+            )
         total_started = time.perf_counter()
         key_started = time.perf_counter()
         mask_key = None
