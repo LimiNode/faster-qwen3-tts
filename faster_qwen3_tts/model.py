@@ -47,6 +47,7 @@ class FasterQwen3TTS:
         prefill_compile_lengths: Optional[Iterable[int]] = None,
         prefill_compile_on_miss: bool = True,
         prefill_unknown_shape_policy: str = "eager",
+        prefill_require_precompiled: bool = False,
     ):
         self.model = base_model  # The qwen-tts Qwen3TTSModel instance
         self.predictor_graph = predictor_graph
@@ -74,6 +75,7 @@ class FasterQwen3TTS:
         self.prefill_unknown_shape_policy = str(prefill_unknown_shape_policy or "eager")
         if self.prefill_unknown_shape_policy not in {"eager", "error"}:
             raise ValueError("prefill_unknown_shape_policy must be eager or error")
+        self.prefill_require_precompiled = bool(prefill_require_precompiled)
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
         self._voice_prompt_cache = {}  # Cache (ref_audio, ref_text) -> (vcp, ref_ids)
@@ -223,6 +225,7 @@ class FasterQwen3TTS:
         prefill_compile_lengths: Optional[Iterable[int]] = None,
         prefill_compile_on_miss: bool = True,
         prefill_unknown_shape_policy: str = "eager",
+        prefill_require_precompiled: bool = False,
     ):
         """
         Load Qwen3-TTS model and prepare CUDA graphs.
@@ -374,6 +377,7 @@ class FasterQwen3TTS:
             prefill_compile_lengths=prefill_compile_lengths,
             prefill_compile_on_miss=prefill_compile_on_miss,
             prefill_unknown_shape_policy=prefill_unknown_shape_policy,
+            prefill_require_precompiled=prefill_require_precompiled,
         )
 
     def warmup(self, prefill_len: int = 100) -> None:
@@ -1578,6 +1582,7 @@ class FasterQwen3TTS:
             prefill_compile_lengths=self.prefill_compile_lengths,
             prefill_compile_on_miss=self.prefill_compile_on_miss,
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
+            prefill_require_precompiled=self.prefill_require_precompiled,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
@@ -1785,6 +1790,7 @@ class FasterQwen3TTS:
             prefill_compile_lengths=self.prefill_compile_lengths,
             prefill_compile_on_miss=self.prefill_compile_on_miss,
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
+            prefill_require_precompiled=self.prefill_require_precompiled,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]

@@ -107,6 +107,7 @@ def _run_talker_prefill(
     prefill_compile_lengths: Optional[Iterable[int]] = None,
     prefill_compile_on_miss: bool = True,
     prefill_unknown_shape_policy: str = "eager",
+    prefill_require_precompiled: bool = False,
     input_metadata: Optional[dict] = None,
 ):
     prefill_backend = _normalize_prefill_backend(prefill_backend)
@@ -151,9 +152,22 @@ def _run_talker_prefill(
         "prefill_compile_cache_evictions": cache_stats["evictions"],
         "prefill_compile_cache_kind": "python_callable_lru",
         "prefill_shape_length": shape_length,
+        "prefill_shape_talker_input_embeds": _jsonable_tensor_signature(
+            _tensor_signature(talker_input_embeds)
+        ),
+        "prefill_shape_attention_mask": _jsonable_tensor_signature(
+            _tensor_signature(prefill_attention_mask)
+        ),
+        "prefill_shape_trailing_text_hiddens": _jsonable_tensor_signature(
+            _tensor_signature(trailing_text_hiddens)
+        ),
+        "prefill_shape_tts_pad_embed": _jsonable_tensor_signature(
+            _tensor_signature(tts_pad_embed)
+        ),
         "prefill_shape_policy": "eager",
         "prefill_shape_allowlist_hit": allowlist_hit,
         "prefill_compile_on_miss": bool(prefill_compile_on_miss),
+        "prefill_require_precompiled": bool(prefill_require_precompiled),
         "prefill_compile_wrapper_create_ms": 0.0,
         "prefill_compile_wrapper_create_host_ms": 0.0,
         "prefill_compiled_call_ms": 0.0,
@@ -259,6 +273,12 @@ def _run_talker_prefill(
             compiled = _prefill_compile_cache_get(cache_key)
             profile["prefill_compile_cache_hit"] = compiled is not None
             if compiled is None:
+                if prefill_require_precompiled:
+                    raise UnsupportedPrefillConfiguration(
+                        "Compiled prefill cache miss is not allowed when "
+                        "prefill_require_precompiled is true: "
+                        f"talker_prefill_length={shape_length}"
+                    )
                 compile_started = time.perf_counter()
                 compiled = _compile_talker_prefill(talker, prefill_backend)
                 profile["prefill_compile_wrapper_create_ms"] = round(
@@ -299,6 +319,8 @@ def _run_talker_prefill(
         message = f"{type(exc).__name__}: {exc}"
         _prefill_compile_cache_drop(cache_key)
         _prefill_compile_error_store(cache_key, message)
+        if prefill_require_precompiled:
+            raise
         profile["prefill_compile_fallback"] = True
         profile["prefill_compile_error"] = message
         return (
@@ -606,6 +628,15 @@ def _tensor_signature(tensor: Optional[torch.Tensor]) -> tuple:
     )
 
 
+def _jsonable_tensor_signature(signature: tuple) -> tuple:
+    if not signature or signature[0] == "none":
+        return signature
+    return (
+        list(signature[0]),
+        *signature[1:],
+    )
+
+
 @torch.inference_mode()
 def fast_generate_streaming(
     talker,
@@ -633,6 +664,7 @@ def fast_generate_streaming(
     prefill_compile_lengths: Optional[Iterable[int]] = None,
     prefill_compile_on_miss: bool = True,
     prefill_unknown_shape_policy: str = "eager",
+    prefill_require_precompiled: bool = False,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -693,6 +725,7 @@ def fast_generate_streaming(
             prefill_compile_lengths=compile_lengths,
             prefill_compile_on_miss=prefill_compile_on_miss,
             prefill_unknown_shape_policy=unknown_shape_policy,
+            prefill_require_precompiled=prefill_require_precompiled,
             input_metadata=input_metadata,
         )
     prefill_profile["talker_forward_launch_wall_ms"] = (
