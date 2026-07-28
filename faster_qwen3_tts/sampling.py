@@ -1,7 +1,7 @@
 """Shared sampling helpers for talker and predictor generation."""
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +55,8 @@ def sample_logits(
     do_sample: bool,
     suppress_mask: Optional[torch.Tensor] = None,
     suppress_tokens: Optional[Iterable[int] | torch.Tensor] = None,
+    phase_timer: Any | None = None,
+    phase_prefix: str = "",
 ) -> torch.Tensor:
     """Sample a token from logits.
 
@@ -63,6 +65,7 @@ def sample_logits(
     suppress_tokens may be a 1-D index tensor (preferred in hot loops — avoids a
     host-to-device copy per call) or any iterable of ints.
     """
+    clone_suppress = _begin_phase(phase_timer, phase_prefix, "clone_suppress")
     logits = logits.clone()
     if suppress_mask is not None:
         logits[..., suppress_mask] = float("-inf")
@@ -71,13 +74,26 @@ def sample_logits(
             suppress_tokens = torch.tensor(list(suppress_tokens), dtype=torch.long, device=logits.device)
         if suppress_tokens.numel() > 0:
             logits[..., suppress_tokens] = float("-inf")
+    _end_phase(phase_timer, phase_prefix, "clone_suppress", clone_suppress)
     if not do_sample:
-        return torch.argmax(logits, dim=-1)
+        argmax = _begin_phase(phase_timer, phase_prefix, "argmax")
+        token = torch.argmax(logits, dim=-1)
+        _end_phase(phase_timer, phase_prefix, "argmax", argmax)
+        return token
+    temperature_phase = _begin_phase(phase_timer, phase_prefix, "temperature")
     logits = logits / temperature
+    _end_phase(phase_timer, phase_prefix, "temperature", temperature_phase)
     if top_k > 0:
+        top_k_phase = _begin_phase(phase_timer, phase_prefix, "top_k")
         topk_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-        logits = torch.where(logits < topk_vals[..., -1:], torch.full_like(logits, float("-inf")), logits)
+        logits = torch.where(
+            logits < topk_vals[..., -1:],
+            torch.full_like(logits, float("-inf")),
+            logits,
+        )
+        _end_phase(phase_timer, phase_prefix, "top_k", top_k_phase)
     if top_p < 1.0:
+        top_p_phase = _begin_phase(phase_timer, phase_prefix, "top_p")
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         probs = F.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(probs, dim=-1)
@@ -86,4 +102,31 @@ def sample_logits(
         sorted_logits[sorted_indices_to_remove] = float("-inf")
         logits = torch.full_like(logits, float("-inf"))
         logits.scatter_(-1, sorted_indices, sorted_logits)
-    return torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
+        _end_phase(phase_timer, phase_prefix, "top_p", top_p_phase)
+    softmax_phase = _begin_phase(phase_timer, phase_prefix, "softmax")
+    probabilities = F.softmax(logits, dim=-1)
+    _end_phase(phase_timer, phase_prefix, "softmax", softmax_phase)
+    multinomial_phase = _begin_phase(phase_timer, phase_prefix, "multinomial")
+    token = torch.multinomial(probabilities, 1).squeeze(-1)
+    _end_phase(phase_timer, phase_prefix, "multinomial", multinomial_phase)
+    return token
+
+
+def _begin_phase(phase_timer: Any | None, prefix: str, name: str) -> Any | None:
+    if phase_timer is None:
+        return None
+    return phase_timer.begin(_phase_name(prefix, name))
+
+
+def _end_phase(
+    phase_timer: Any | None,
+    prefix: str,
+    name: str,
+    start: Any | None,
+) -> None:
+    if phase_timer is not None:
+        phase_timer.end(_phase_name(prefix, name), start)
+
+
+def _phase_name(prefix: str, name: str) -> str:
+    return f"{prefix}_{name}" if prefix else name

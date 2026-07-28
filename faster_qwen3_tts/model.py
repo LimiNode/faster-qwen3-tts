@@ -1584,45 +1584,108 @@ class FasterQwen3TTS:
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
             prefill_require_precompiled=self.prefill_require_precompiled,
         ):
+            wrapper_started = time.perf_counter()
+            context_started = time.perf_counter()
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
             all_flat = torch.cat(all_codes, dim=0)
             n_total = all_flat.shape[0]
 
             if samples_per_frame is None:
-                audio_list, sr = speech_tokenizer.decode(
-                    {"audio_codes": all_flat.unsqueeze(0)}
-                )
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
+                decode_input = all_flat
+            else:
+                ctx_start = max(0, n_total - n_new - context_frames)
+                decode_input = all_flat[ctx_start:]
+            codec_context_assembly_ms = (time.perf_counter() - context_started) * 1000
 
+            codec_start_event = None
+            if profile_prefill and codec_chunk.device.type == "cuda":
+                codec_start_event = torch.cuda.Event(enable_timing=True)
+                codec_start_event.record()
+            codec_decode_started = time.perf_counter()
+            audio_list, sr = speech_tokenizer.decode(
+                {"audio_codes": decode_input.unsqueeze(0)}
+            )
+            speech_tokenizer_decode_wall_ms = (
+                time.perf_counter() - codec_decode_started
+            ) * 1000
+            codec_end_event = None
+            if codec_start_event is not None:
+                codec_end_event = torch.cuda.Event(enable_timing=True)
+                codec_end_event.record()
+
+            audio = audio_list[0]
+            d2h_ms = 0.0
+            numpy_ms = 0.0
+            audio_flatten_ms = 0.0
+            if hasattr(audio, "cpu"):
+                flatten_started = time.perf_counter()
+                audio = audio.flatten()
+                audio_flatten_ms = (time.perf_counter() - flatten_started) * 1000
+                d2h_started = time.perf_counter()
+                audio = audio.cpu()
+                d2h_ms = (time.perf_counter() - d2h_started) * 1000
+                numpy_started = time.perf_counter()
+                audio = audio.numpy()
+                numpy_ms = (time.perf_counter() - numpy_started) * 1000
+            else:
+                flatten_started = time.perf_counter()
+                audio = audio.flatten() if hasattr(audio, "flatten") else audio
+                audio_flatten_ms = (time.perf_counter() - flatten_started) * 1000
+
+            speech_tokenizer_decode_gpu_ms = None
+            if codec_start_event is not None and codec_end_event is not None:
+                speech_tokenizer_decode_gpu_ms = codec_start_event.elapsed_time(
+                    codec_end_event
+                )
+
+            audio_slice_started = time.perf_counter()
+            if samples_per_frame is None:
                 new_audio = audio[prev_audio_len:]
                 prev_audio_len = len(audio)
 
                 if n_total >= min_calibration_frames:
                     samples_per_frame = len(audio) / n_total
             else:
-                ctx_start = max(0, n_total - n_new - context_frames)
-                window = all_flat[ctx_start:]
-                n_ctx = window.shape[0] - n_new
-
-                audio_list, sr = speech_tokenizer.decode(
-                    {"audio_codes": window.unsqueeze(0)}
-                )
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
+                n_ctx = decode_input.shape[0] - n_new
 
                 if n_ctx > 0:
                     ctx_samples = int(round(n_ctx * samples_per_frame))
                     new_audio = audio[ctx_samples:]
                 else:
                     new_audio = audio
+
+            audio_slice_ms = (time.perf_counter() - audio_slice_started) * 1000
+            codec_wrapper_wall_ms = (time.perf_counter() - wrapper_started) * 1000
+            codec_wrapper_other_ms = codec_wrapper_wall_ms - sum(
+                (
+                    codec_context_assembly_ms,
+                    speech_tokenizer_decode_wall_ms,
+                    d2h_ms,
+                    numpy_ms,
+                    audio_flatten_ms,
+                    audio_slice_ms,
+                )
+            )
+            if profile_prefill:
+                timing.update(
+                    {
+                        "codec_context_assembly_ms": codec_context_assembly_ms,
+                        "speech_tokenizer_decode_wall_ms": (
+                            speech_tokenizer_decode_wall_ms
+                        ),
+                        "d2h_ms": d2h_ms,
+                        "numpy_ms": numpy_ms,
+                        "audio_flatten_ms": audio_flatten_ms,
+                        "audio_slice_ms": audio_slice_ms,
+                        "codec_wrapper_wall_ms": codec_wrapper_wall_ms,
+                        "codec_wrapper_other_ms": codec_wrapper_other_ms,
+                    }
+                )
+                if speech_tokenizer_decode_gpu_ms is not None:
+                    timing["speech_tokenizer_decode_gpu_ms"] = (
+                        speech_tokenizer_decode_gpu_ms
+                    )
 
             yield new_audio, sr, timing
 

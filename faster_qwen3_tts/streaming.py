@@ -67,6 +67,34 @@ class _CudaNvtxRange:
         return False
 
 
+class _DecodePhaseTimer:
+    """Collect optional GPU timings without adding a synchronization boundary."""
+
+    def __init__(self, device: torch.device, enabled: bool) -> None:
+        self._enabled = bool(enabled and device.type == "cuda")
+        self._pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+
+    def begin(self, name: str) -> torch.cuda.Event | None:
+        if not self._enabled:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def end(self, name: str, start: torch.cuda.Event | None) -> None:
+        if start is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self._pairs.setdefault(name, []).append((start, end))
+
+    def metrics(self) -> dict[str, float]:
+        return {
+            f"{name}_gpu_ms": sum(start.elapsed_time(end) for start, end in pairs)
+            for name, pairs in self._pairs.items()
+        }
+
+
 def _normalize_prefill_backend(prefill_backend: str) -> str:
     backend = str(prefill_backend or "eager").strip().lower()
     backend = _PREFILL_BACKEND_ALIASES.get(backend, backend)
@@ -677,8 +705,11 @@ def fast_generate_streaming(
     vocab_size = config.vocab_size
     device = talker_input_embeds.device
 
+    decode_phase_timer = _DecodePhaseTimer(device, profile_prefill)
+    first_sample_setup = decode_phase_timer.begin("first_sample_setup")
     suppress_mask = build_suppress_mask(vocab_size, eos_id, device)
     eos_suppress_ids = torch.tensor([eos_id], dtype=torch.long, device=device)
+    decode_phase_timer.end("first_sample_setup", first_sample_setup)
 
     predictor = talker.code_predictor
     talker_codec_embed = talker.get_input_embeddings()
@@ -739,8 +770,10 @@ def fast_generate_streaming(
     gen_step = out.generation_step
 
     sample_started = time.perf_counter()
+    first_sample_logits = decode_phase_timer.begin("first_sample_logits_prepare")
+    logits = out.logits[:, -1, :]
+    decode_phase_timer.end("first_sample_logits_prepare", first_sample_logits)
     with _CudaNvtxRange("qtb_prefill_first_sample", nvtx_enabled):
-        logits = out.logits[:, -1, :]
         suppress_eos = min_new_tokens > 0
         token = sample_logits(
             logits,
@@ -750,6 +783,8 @@ def fast_generate_streaming(
             do_sample=do_sample,
             suppress_mask=suppress_mask,
             suppress_tokens=eos_suppress_ids if suppress_eos else None,
+            phase_timer=decode_phase_timer,
+            phase_prefix="first_sample",
         )
     prefill_profile["first_sample_launch_wall_ms"] = (
         time.perf_counter() - sample_started
@@ -874,18 +909,23 @@ def fast_generate_streaming(
             break
 
         # --- CUDA-Graphed Code Predictor ---
+        predictor_phase = decode_phase_timer.begin("ar_predictor_graph")
         last_id_hidden = talker_codec_embed(token.unsqueeze(1))
         pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
         codebook_token_ids = predictor_graph.run(pred_input)
+        decode_phase_timer.end("ar_predictor_graph", predictor_phase)
 
         all_cb = torch.cat([token.view(1), codebook_token_ids])
         chunk_buffer.append(all_cb.detach())
+        history_phase = decode_phase_timer.begin("ar_history_update")
         if rep_history is not None:
             rep_history[step_idx : step_idx + 1] = token
+        decode_phase_timer.end("ar_history_update", history_phase)
 
         # --- Build input embedding for talker ---
         # One fused gather over all 15 codebook tables; the cat+sum keeps the
         # exact reduction order of the previous per-table loop for parity.
+        embedding_phase = decode_phase_timer.begin("ar_codebook_embed_gather")
         codebook_embeds = F.embedding(
             codebook_token_ids + fused_codec_offsets, fused_codec_weights
         ).unsqueeze(0)  # [1, 15, H]
@@ -899,6 +939,7 @@ def fast_generate_streaming(
             ].unsqueeze(1)
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
+        decode_phase_timer.end("ar_codebook_embed_gather", embedding_phase)
 
         # --- CUDA-Graphed Talker decode step ---
         current_pos = prefill_len + step_idx
@@ -912,14 +953,18 @@ def fast_generate_streaming(
             )
             break
 
+        talker_phase = decode_phase_timer.begin("ar_talker_graph_replay")
         hidden_states = talker_graph.run(inputs_embeds, position=current_pos)
+        decode_phase_timer.end("ar_talker_graph_replay", talker_phase)
 
+        logits_phase = decode_phase_timer.begin("ar_logits_prepare")
         logits = talker_codec_head(hidden_states[:, -1, :]).unsqueeze(0)
 
         if rep_history is not None:
             logits = apply_repetition_penalty(
                 logits, rep_history[: step_idx + 1], repetition_penalty
             )
+        decode_phase_timer.end("ar_logits_prepare", logits_phase)
 
         suppress_eos = step_idx + 1 < min_new_tokens
         token = sample_logits(
@@ -930,12 +975,16 @@ def fast_generate_streaming(
             do_sample=do_sample,
             suppress_mask=suppress_mask,
             suppress_tokens=eos_suppress_ids if suppress_eos else None,
+            phase_timer=decode_phase_timer,
+            phase_prefix="ar_sample",
         )
+        state_phase = decode_phase_timer.begin("ar_state_update")
         next_slot = (step_idx + 1) % 2
         token_cpu[next_slot : next_slot + 1].copy_(token, non_blocking=True)
         token_events[next_slot].record()
         past_hidden = hidden_states[:, -1:, :].clone()
         gen_step += 1
+        decode_phase_timer.end("ar_state_update", state_phase)
 
         # --- Yield chunk when buffer is full ---
         if len(chunk_buffer) >= chunk_size:
@@ -966,6 +1015,8 @@ def fast_generate_streaming(
             chunk_decode_time = time.time() - chunk_start
             total_steps += len(chunk_buffer)
             is_final_chunk = eos_found or step_idx + 1 >= max_new_tokens
+            if chunk_count == 0:
+                prefill_profile.update(decode_phase_timer.metrics())
 
             yield (
                 torch.stack(chunk_buffer),
@@ -1025,6 +1076,8 @@ def fast_generate_streaming(
     if chunk_buffer:
         chunk_decode_time = time.time() - chunk_start
         total_steps += len(chunk_buffer)
+        if chunk_count == 0:
+            prefill_profile.update(decode_phase_timer.metrics())
 
         yield (
             torch.stack(chunk_buffer),
