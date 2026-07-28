@@ -7,7 +7,9 @@ CUDA graph usage is identical to non-streaming — same per-step performance.
 """
 
 import math
+import threading
 import time
+from collections import OrderedDict
 from typing import Callable, Generator, Optional, Tuple
 
 import torch
@@ -37,8 +39,10 @@ _PREFILL_BACKENDS = {
 _PREFILL_BACKEND_ALIASES = {
     "compile_default": "compile_inductor_default",
 }
-_PREFILL_COMPILE_CACHE = {}
-_PREFILL_COMPILE_ERRORS = {}
+_PREFILL_COMPILE_CACHE_MAX_ENTRIES = 64
+_PREFILL_COMPILE_CACHE = OrderedDict()
+_PREFILL_COMPILE_ERRORS = OrderedDict()
+_PREFILL_COMPILE_CACHE_LOCK = threading.RLock()
 
 
 class UnsupportedPrefillConfiguration(ValueError):
@@ -100,6 +104,7 @@ def _run_talker_prefill(
         attention_mask=prefill_attention_mask,
         input_metadata=input_metadata,
     )
+    cache_stats = prefill_compile_cache_stats()
     profile = {
         "prefill_backend_requested": prefill_backend,
         "prefill_backend_used": "eager",
@@ -108,6 +113,10 @@ def _run_talker_prefill(
         "prefill_mask_mode": prefill_mask_mode,
         "prefill_skip_causal_mask": skip_prefill_causal_mask,
         "prefill_compile_compat_mode": prefill_compile_compat_mode,
+        "prefill_compile_cache_hit": False,
+        "prefill_compile_cache_entries": cache_stats["entries"],
+        "prefill_compile_cache_max_entries": cache_stats["max_entries"],
+        "prefill_compile_wall_ms": 0.0,
     }
     if prefill_backend == "eager":
         return (
@@ -132,9 +141,10 @@ def _run_talker_prefill(
         prefill_mask_mode,
         prefill_compile_compat_mode,
     )
-    if cache_key in _PREFILL_COMPILE_ERRORS:
+    cached_error = _prefill_compile_error(cache_key)
+    if cached_error is not None:
         profile["prefill_compile_fallback"] = True
-        profile["prefill_compile_error"] = _PREFILL_COMPILE_ERRORS[cache_key]
+        profile["prefill_compile_error"] = cached_error
         return (
             _talker_prefill_eager(
                 talker,
@@ -156,10 +166,19 @@ def _run_talker_prefill(
             prefill_compile_compat_mode,
         ) as metadata:
             profile.update(metadata)
-            compiled = _PREFILL_COMPILE_CACHE.get(cache_key)
+            compiled = _prefill_compile_cache_get(cache_key)
+            profile["prefill_compile_cache_hit"] = compiled is not None
             if compiled is None:
+                compile_started = time.perf_counter()
                 compiled = _compile_talker_prefill(talker, prefill_backend)
-                _PREFILL_COMPILE_CACHE[cache_key] = compiled
+                profile["prefill_compile_wall_ms"] = round(
+                    (time.perf_counter() - compile_started) * 1000.0,
+                    3,
+                )
+                _prefill_compile_cache_store(cache_key, compiled)
+            cache_stats = prefill_compile_cache_stats()
+            profile["prefill_compile_cache_entries"] = cache_stats["entries"]
+            profile["prefill_compile_cache_max_entries"] = cache_stats["max_entries"]
             out = compiled(
                 talker_input_embeds,
                 prefill_attention_mask,
@@ -169,7 +188,7 @@ def _run_talker_prefill(
             )
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
-        _PREFILL_COMPILE_ERRORS[cache_key] = message
+        _prefill_compile_error_store(cache_key, message)
         profile["prefill_compile_fallback"] = True
         profile["prefill_compile_error"] = message
         return (
@@ -186,6 +205,74 @@ def _run_talker_prefill(
 
     profile["prefill_backend_used"] = prefill_backend
     return out, profile
+
+
+def prefill_compile_cache_stats() -> dict[str, int]:
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        return {
+            "entries": len(_PREFILL_COMPILE_CACHE),
+            "errors": len(_PREFILL_COMPILE_ERRORS),
+            "max_entries": _PREFILL_COMPILE_CACHE_MAX_ENTRIES,
+        }
+
+
+def clear_prefill_compile_cache(talker=None) -> dict[str, int]:
+    talker_id = id(talker) if talker is not None else None
+    removed_entries = 0
+    removed_errors = 0
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        for key in list(_PREFILL_COMPILE_CACHE):
+            if talker_id is None or _cache_key_talker_id(key) == talker_id:
+                del _PREFILL_COMPILE_CACHE[key]
+                removed_entries += 1
+        for key in list(_PREFILL_COMPILE_ERRORS):
+            if talker_id is None or _cache_key_talker_id(key) == talker_id:
+                del _PREFILL_COMPILE_ERRORS[key]
+                removed_errors += 1
+    return {
+        "removed_entries": removed_entries,
+        "removed_errors": removed_errors,
+        **prefill_compile_cache_stats(),
+    }
+
+
+def _prefill_compile_cache_get(cache_key: tuple):
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        compiled = _PREFILL_COMPILE_CACHE.get(cache_key)
+        if compiled is not None:
+            _PREFILL_COMPILE_CACHE.move_to_end(cache_key)
+        return compiled
+
+
+def _prefill_compile_cache_store(cache_key: tuple, compiled) -> None:
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        _PREFILL_COMPILE_CACHE[cache_key] = compiled
+        _PREFILL_COMPILE_CACHE.move_to_end(cache_key)
+        while len(_PREFILL_COMPILE_CACHE) > _PREFILL_COMPILE_CACHE_MAX_ENTRIES:
+            _PREFILL_COMPILE_CACHE.popitem(last=False)
+
+
+def _prefill_compile_error(cache_key: tuple) -> str | None:
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        message = _PREFILL_COMPILE_ERRORS.get(cache_key)
+        if message is not None:
+            _PREFILL_COMPILE_ERRORS.move_to_end(cache_key)
+        return message
+
+
+def _prefill_compile_error_store(cache_key: tuple, message: str) -> None:
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        _PREFILL_COMPILE_ERRORS[cache_key] = message
+        _PREFILL_COMPILE_ERRORS.move_to_end(cache_key)
+        while len(_PREFILL_COMPILE_ERRORS) > _PREFILL_COMPILE_CACHE_MAX_ENTRIES:
+            _PREFILL_COMPILE_ERRORS.popitem(last=False)
+
+
+def _cache_key_talker_id(cache_key: tuple) -> int | None:
+    if not cache_key:
+        return None
+    value = cache_key[0]
+    return value if isinstance(value, int) else None
 
 
 def _normalize_prefill_mask_mode(prefill_mask_mode: str) -> str:

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 import types
-from contextlib import contextmanager
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import torch
@@ -19,6 +20,7 @@ SUPPORTED_PREFILL_COMPILE_COMPAT_MODES = {
     "strict_bf16_sdpa_v1",
 }
 PREFILL_COMPILE_COMPAT_METADATA_VERSION = 1
+_LOCK_CREATION_LOCK = threading.Lock()
 
 
 @torch.library.custom_op("faster_qwen3_tts::strict_add", mutates_args=())
@@ -138,6 +140,9 @@ def configure_prefill_compile_compat(talker: Any, mode: str) -> dict[str, Any]:
         talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
         talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = {}
         talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = {}
+        talker._faster_qwen3_tts_prefill_compile_compat_target_fingerprint = (
+            _target_fingerprint_from_counts({})
+        )
         return prefill_compile_compat_metadata(talker)
 
     targets = _collect_prefill_compile_compat_targets(talker)
@@ -146,6 +151,9 @@ def configure_prefill_compile_compat(talker: Any, mode: str) -> dict[str, Any]:
     talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
     talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = {}
     talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = dict(patched)
+    talker._faster_qwen3_tts_prefill_compile_compat_target_fingerprint = (
+        _target_fingerprint_from_counts(patched)
+    )
     return prefill_compile_compat_metadata(talker)
 
 
@@ -208,6 +216,11 @@ def prefill_compile_compat_metadata(talker: Any) -> dict[str, Any]:
             patched,
         )
     )
+    fingerprint = getattr(
+        talker,
+        "_faster_qwen3_tts_prefill_compile_compat_target_fingerprint",
+        _target_fingerprint_from_counts(validated),
+    )
     return {
         "prefill_compile_compat_metadata_version": (
             PREFILL_COMPILE_COMPAT_METADATA_VERSION
@@ -222,6 +235,7 @@ def prefill_compile_compat_metadata(talker: Any) -> dict[str, Any]:
         "prefill_compile_compat_reused": bool(patched),
         "prefill_compile_compat_patched_modules": patched,
         "prefill_compile_compat_validated_modules": validated,
+        "prefill_compile_compat_target_fingerprint": dict(fingerprint),
     }
 
 
@@ -235,6 +249,29 @@ def prefill_compile_compat_context(
     if mode == "none":
         yield prefill_compile_compat_metadata(talker)
         return
+
+    lock = _prefill_compile_compat_lock(talker)
+    with lock:
+        yield from _locked_prefill_compile_compat_context(talker, mode)
+
+
+def _prefill_compile_compat_lock(talker: Any) -> threading.RLock:
+    lock = getattr(talker, "_faster_qwen3_tts_prefill_compile_compat_lock", None)
+    if lock is not None:
+        return lock
+    with _LOCK_CREATION_LOCK:
+        lock = getattr(talker, "_faster_qwen3_tts_prefill_compile_compat_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            talker._faster_qwen3_tts_prefill_compile_compat_lock = lock
+        return lock
+
+
+def _locked_prefill_compile_compat_context(
+    talker: Any,
+    mode: str,
+) -> Iterator[dict[str, Any]]:
+    """Run strict prefill context while the per-Talker lock is held."""
 
     declared = getattr(
         talker,
@@ -269,6 +306,9 @@ def prefill_compile_compat_context(
         talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
         talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = dict(patched)
         talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = dict(patched)
+        talker._faster_qwen3_tts_prefill_compile_compat_target_fingerprint = (
+            _target_fingerprint_from_counts(patched)
+        )
         talker._faster_qwen3_tts_prefill_compile_compat_active = True
         yield prefill_compile_compat_metadata(talker)
     finally:
@@ -308,6 +348,9 @@ def apply_prefill_compile_compat(talker: Any, mode: str) -> dict[str, Any]:
     talker._faster_qwen3_tts_prefill_compile_compat_mode = mode
     talker._faster_qwen3_tts_prefill_compile_compat_patched_modules = dict(patched)
     talker._faster_qwen3_tts_prefill_compile_compat_validated_modules = dict(patched)
+    talker._faster_qwen3_tts_prefill_compile_compat_target_fingerprint = (
+        _target_fingerprint_from_counts(patched)
+    )
     return {
         "prefill_compile_compat_mode": mode,
         "prefill_compile_compat_applied": True,
@@ -337,6 +380,16 @@ def _validated_prefill_compile_compat_counts(
     if patched["rmsnorm"] == 0 or patched["mlp"] == 0 or patched["attention"] == 0:
         raise RuntimeError(f"Incomplete prefill compile compatibility patch: {patched!r}")
     return patched
+
+
+def _target_fingerprint_from_counts(counts: dict[str, int]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "rmsnorm": int(counts.get("rmsnorm", 0)),
+        "mlp": int(counts.get("mlp", 0)),
+        "attention": int(counts.get("attention", 0)),
+        "expected_decoder_layers": int(counts.get("attention", 0)),
+    }
 
 
 def validate_strict_bf16_sdpa_v1(

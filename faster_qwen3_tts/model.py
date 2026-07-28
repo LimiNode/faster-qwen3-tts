@@ -19,6 +19,7 @@ from .prefill_compat import (
     normalize_prefill_compile_compat_mode,
     prefill_compile_compat_metadata,
 )
+from .streaming import clear_prefill_compile_cache
 from .utils import suppress_flash_attn_warning
 
 logger = logging.getLogger(__name__)
@@ -358,6 +359,13 @@ class FasterQwen3TTS:
     def _warmup(self, prefill_len: int) -> None:
         """Compatibility alias for the former private warmup entry point."""
         self.warmup(prefill_len=prefill_len)
+
+    def close(self) -> None:
+        """Release per-model compiled prefill cache entries."""
+        try:
+            clear_prefill_compile_cache(self.model.model.talker)
+        except Exception:
+            logger.debug("Failed to clear prefill compile cache", exc_info=True)
 
     def generate(
         self,

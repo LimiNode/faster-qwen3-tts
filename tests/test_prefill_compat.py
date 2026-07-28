@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 
 import pytest
@@ -6,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from faster_qwen3_tts import prefill_compat
+from faster_qwen3_tts import streaming
 from faster_qwen3_tts.model import FasterQwen3TTS
 
 
@@ -213,6 +215,13 @@ def test_configure_prefill_compile_compat_strict_rejects_later_none():
         "mlp": 1,
         "rmsnorm": 1,
     }
+    assert metadata["prefill_compile_compat_target_fingerprint"] == {
+        "schema_version": 1,
+        "attention": 1,
+        "expected_decoder_layers": 1,
+        "mlp": 1,
+        "rmsnorm": 1,
+    }
     assert talker.attn.forward == original_attention_forward
 
     with pytest.raises(RuntimeError, match="does not match"):
@@ -248,6 +257,60 @@ def test_prefill_compile_compat_context_restores_original_forwards():
         "mlp": 1,
         "rmsnorm": 1,
     }
+
+
+def test_prefill_compile_compat_context_serializes_concurrent_threads():
+    talker = CompleteTalker()
+    original_attention_forward = talker.attn.forward
+    prefill_compat.configure_prefill_compile_compat(
+        talker,
+        "strict_bf16_sdpa_v1",
+    )
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    failures: list[BaseException] = []
+
+    def first() -> None:
+        try:
+            with prefill_compat.prefill_compile_compat_context(
+                talker,
+                "strict_bf16_sdpa_v1",
+            ):
+                first_entered.set()
+                release_first.wait(timeout=5.0)
+        except BaseException as exc:
+            failures.append(exc)
+
+    def second() -> None:
+        try:
+            first_entered.wait(timeout=5.0)
+            with prefill_compat.prefill_compile_compat_context(
+                talker,
+                "strict_bf16_sdpa_v1",
+            ):
+                second_entered.set()
+                assert talker.attn.forward != original_attention_forward
+        except BaseException as exc:
+            failures.append(exc)
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    second_thread.start()
+
+    assert first_entered.wait(timeout=5.0)
+    assert not second_entered.wait(timeout=0.1)
+    release_first.set()
+    first_thread.join(timeout=5.0)
+    second_thread.join(timeout=5.0)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert failures == []
+    assert second_entered.is_set()
+    assert talker.attn.forward == original_attention_forward
 
 
 def test_legacy_unconfigured_talker_cannot_report_none_after_strict_patch():
@@ -339,3 +402,19 @@ def test_from_pretrained_propagates_strict_prefill_compat_metadata(monkeypatch):
         "mlp": 1,
         "rmsnorm": 1,
     }
+
+
+def test_faster_wrapper_close_clears_prefill_compile_cache():
+    talker = CompleteTalker()
+    model = FasterQwen3TTS.__new__(FasterQwen3TTS)
+    model.model = types.SimpleNamespace(
+        model=types.SimpleNamespace(talker=talker)
+    )
+    streaming.clear_prefill_compile_cache()
+    streaming._prefill_compile_cache_store((id(talker), "shape-a"), object())
+    streaming._prefill_compile_cache_store((id(object()), "shape-b"), object())
+
+    model.close()
+
+    assert streaming.prefill_compile_cache_stats()["entries"] == 1
+    streaming.clear_prefill_compile_cache()
