@@ -13,6 +13,8 @@ Strategy:
 - Capture the single-token decode as a CUDA graph
 - Update cache_position buffer between replays
 """
+import time
+
 import torch
 from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -57,6 +59,7 @@ class TalkerGraph:
         self.attn_mask = None
         self.attn_mask_table = None
         self._mask_key = None
+        self.last_generation_state_profile = {}
 
     def _init_cache_layers(self):
         """Force lazy initialization of StaticCache layers before graph capture."""
@@ -69,6 +72,7 @@ class TalkerGraph:
                 layer.lazy_initialization(dummy_k)
 
     def _build_attention_masks(self, attention_mask: torch.Tensor | None = None):
+        build_started = time.perf_counter()
         dummy = torch.zeros(1, 1, self.hidden_size, dtype=self.dtype, device=self.device)
         max_len = self.max_seq_len
         self.attn_mask_table = [None] * max_len
@@ -90,6 +94,13 @@ class TalkerGraph:
             self.attn_mask = self.attn_mask_table[0].clone()
         else:
             self.attn_mask.copy_(self.attn_mask_table[0])
+        return {
+            "generation_state_mask_table_build_ms": round(
+                (time.perf_counter() - build_started) * 1000.0,
+                3,
+            ),
+            "generation_state_masks_built": max_len,
+        }
 
     def _set_attention_mask(self, position: int):
         self.attn_mask.copy_(self.attn_mask_table[position])
@@ -169,31 +180,73 @@ class TalkerGraph:
             self.static_cache.update(k, v, li, {"cache_position": cache_pos})
         return seq_len
 
-    def set_generation_state(self, attention_mask: torch.Tensor, rope_deltas: torch.Tensor | None):
+    def set_generation_state(
+        self,
+        attention_mask: torch.Tensor | None,
+        rope_deltas: torch.Tensor | None,
+        *,
+        attention_mask_all_valid: bool = False,
+    ):
         """Set padding-aware attention mask and rope deltas for decode parity."""
+        total_started = time.perf_counter()
+        key_started = time.perf_counter()
         mask_key = None
         full_attention_mask = None
-        if attention_mask is not None:
+        normalized_all_valid = bool(attention_mask_all_valid)
+        if attention_mask is not None and not normalized_all_valid:
             pad_counts = (attention_mask == 0).sum(dim=-1)
-            mask_key = tuple(pad_counts.tolist())
-            full_attention_mask = torch.ones(
-                attention_mask.shape[0],
-                self.max_seq_len,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-            for b, pads in enumerate(pad_counts.tolist()):
-                if pads > 0:
+            pad_counts_tuple = tuple(int(value) for value in pad_counts.tolist())
+            normalized_all_valid = all(pads == 0 for pads in pad_counts_tuple)
+            if not normalized_all_valid:
+                mask_key = pad_counts_tuple
+                full_attention_mask = torch.ones(
+                    attention_mask.shape[0],
+                    self.max_seq_len,
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                for b, pads in enumerate(pad_counts_tuple):
                     full_attention_mask[b, :pads] = 0
+        key_ms = (time.perf_counter() - key_started) * 1000.0
+        previous_mask_key = self._mask_key
+        mask_cache_hit = (
+            self.attn_mask_table is not None and mask_key == previous_mask_key
+        )
+        build_profile = {
+            "generation_state_mask_table_build_ms": 0.0,
+            "generation_state_masks_built": 0,
+        }
         if self.attn_mask_table is None or mask_key != self._mask_key:
-            self._build_attention_masks(full_attention_mask)
+            build_profile = self._build_attention_masks(full_attention_mask)
             self._mask_key = mask_key
+        rope_started = time.perf_counter()
         if rope_deltas is None:
             self.rope_deltas.zero_()
         else:
             if rope_deltas.dim() == 1:
                 rope_deltas = rope_deltas.unsqueeze(1)
-            self.rope_deltas.copy_(rope_deltas.to(self.rope_deltas.device, dtype=self.rope_deltas.dtype))
+            self.rope_deltas.copy_(
+                rope_deltas.to(
+                    self.rope_deltas.device,
+                    dtype=self.rope_deltas.dtype,
+                )
+            )
+        rope_ms = (time.perf_counter() - rope_started) * 1000.0
+        self.last_generation_state_profile = {
+            "generation_state_total_ms": round(
+                (time.perf_counter() - total_started) * 1000.0,
+                3,
+            ),
+            "generation_state_mask_key_ms": round(key_ms, 3),
+            "generation_state_rope_copy_ms": round(rope_ms, 3),
+            "generation_state_mask_cache_hit": mask_cache_hit,
+            "generation_state_mask_key": _profile_mask_key(mask_key),
+            "generation_state_previous_mask_key": _profile_mask_key(
+                previous_mask_key
+            ),
+            "generation_state_attention_mask_all_valid": normalized_all_valid,
+            **build_profile,
+        }
 
     @torch.inference_mode()
     def run(self, input_embeds: torch.Tensor, position: int) -> torch.Tensor:
@@ -212,3 +265,9 @@ class TalkerGraph:
         self.graph.replay()
 
         return self.output_buf  # static buffer — caller should use immediately or clone
+ 
+ 
+def _profile_mask_key(mask_key):
+    if mask_key is None:
+        return None
+    return list(mask_key)

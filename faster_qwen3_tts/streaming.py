@@ -767,10 +767,26 @@ def fast_generate_streaming(
     generation_state_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_generation_state", nvtx_enabled):
         rope_deltas = getattr(talker, "rope_deltas", None)
-        talker_graph.set_generation_state(attention_mask, rope_deltas)
+        attention_mask_all_valid = (
+            isinstance(input_metadata, dict)
+            and input_metadata.get("prefill_attention_mask_all_valid") is True
+        )
+        generation_attention_mask = None if attention_mask_all_valid else attention_mask
+        talker_graph.set_generation_state(
+            generation_attention_mask,
+            rope_deltas,
+            attention_mask_all_valid=attention_mask_all_valid,
+        )
     prefill_profile["generation_state_wall_ms"] = (
         time.perf_counter() - generation_state_started
     ) * 1000
+    generation_state_profile = getattr(
+        talker_graph,
+        "last_generation_state_profile",
+        None,
+    )
+    if isinstance(generation_state_profile, dict):
+        prefill_profile.update(generation_state_profile)
     prefill_events.record("after_generation_state")
 
     # Deferred EOS detection (see fast_generate): tokens are copied to a pinned
