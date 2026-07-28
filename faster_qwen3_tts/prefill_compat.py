@@ -437,16 +437,6 @@ def _strict_attention_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
-    if attention_mask is not None:
-        return _call_original_attention(
-            self,
-            hidden_states,
-            position_embeddings,
-            attention_mask,
-            past_key_values,
-            cache_position,
-            **kwargs,
-        )
     if self.training or kwargs.get("output_attentions", False):
         return _call_original_attention(
             self,
@@ -480,7 +470,7 @@ def _strict_attention_forward(
         self.scaling,
         self.num_key_value_groups,
         is_causal,
-        use_gqa_in_sdpa(attention_mask, key_states),
+        use_gqa_in_sdpa(None, key_states),
     )
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     return self.o_proj(attn_output), None
