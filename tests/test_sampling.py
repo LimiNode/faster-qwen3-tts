@@ -74,6 +74,30 @@ def test_faster_wrapper_uses_loaded_prefill_compile_compat_mode_by_default():
         model._resolve_prefill_compile_compat_mode("none")
 
 
+def test_faster_wrapper_can_make_prefill_backend_immutable():
+    model = FasterQwen3TTS.__new__(FasterQwen3TTS)
+    model.prefill_backend = "compile_reduce_overhead"
+
+    assert model._resolve_prefill_backend(None) == "compile_reduce_overhead"
+    assert (
+        model._resolve_prefill_backend("compile_reduce_overhead")
+        == "compile_reduce_overhead"
+    )
+    with pytest.raises(RuntimeError, match="immutable"):
+        model._resolve_prefill_backend("compile_inductor_default")
+
+
+def test_faster_wrapper_without_loaded_prefill_backend_preserves_request_override():
+    model = FasterQwen3TTS.__new__(FasterQwen3TTS)
+    model.prefill_backend = None
+
+    assert model._resolve_prefill_backend(None) == "eager"
+    assert (
+        model._resolve_prefill_backend("compile_backend_eager")
+        == "compile_backend_eager"
+    )
+
+
 @pytest.mark.parametrize(
     ("metadata", "expected"),
     [
@@ -293,6 +317,111 @@ def test_run_talker_prefill_allows_compiled_verified_skip_masks():
         prefill_backend="compile_backend_eager",
         prefill_mask_mode="skip",
     )
+
+
+def test_run_talker_prefill_compiles_allowlisted_length(monkeypatch):
+    class DummyTalker:
+        def forward(self, **kwargs):
+            hidden = kwargs["inputs_embeds"]
+            return types.SimpleNamespace(
+                logits=torch.zeros(1, hidden.shape[1], 3),
+                past_hidden=hidden[:, -1:, :],
+                past_key_values=[],
+                generation_step=0,
+            )
+
+    compile_calls = []
+
+    def fake_compile(talker, backend):
+        compile_calls.append((talker, backend))
+
+        def compiled(*args):
+            return DummyTalker().forward(
+                inputs_embeds=args[0],
+                attention_mask=args[1],
+                trailing_text_hidden=args[2],
+                tts_pad_embed=args[3],
+                skip_prefill_causal_mask=args[4],
+            )
+
+        return compiled
+
+    monkeypatch.setattr(streaming, "_compile_talker_prefill", fake_compile)
+    tie, tam, tth, tpe = _dummy_prefill_inputs()
+    _out, profile = _run_talker_prefill(
+        DummyTalker(),
+        tie,
+        tam,
+        tth,
+        tpe,
+        prefill_backend="compile_backend_eager",
+        prefill_mask_mode="skip",
+        prefill_compile_lengths=[tie.shape[1]],
+        prefill_compile_on_miss=False,
+        prefill_unknown_shape_policy="eager",
+    )
+
+    assert len(compile_calls) == 1
+    assert profile["prefill_backend_used"] == "compile_backend_eager"
+    assert profile["prefill_shape_policy"] == "compiled_allowlist"
+    assert profile["prefill_shape_allowlist_hit"] is True
+
+
+def test_run_talker_prefill_unknown_length_uses_eager_before_compile(monkeypatch):
+    class DummyTalker:
+        def forward(self, **kwargs):
+            hidden = kwargs["inputs_embeds"]
+            return types.SimpleNamespace(
+                logits=torch.zeros(1, hidden.shape[1], 3),
+                past_hidden=hidden[:, -1:, :],
+                past_key_values=[],
+                generation_step=0,
+            )
+
+    def fail_compile(*_args, **_kwargs):
+        raise AssertionError("unknown shapes must not compile on user path")
+
+    monkeypatch.setattr(streaming, "_compile_talker_prefill", fail_compile)
+    tie, tam, tth, tpe = _dummy_prefill_inputs()
+    _out, profile = _run_talker_prefill(
+        DummyTalker(),
+        tie,
+        tam,
+        tth,
+        tpe,
+        prefill_backend="compile_backend_eager",
+        prefill_mask_mode="skip",
+        prefill_compile_lengths=[tie.shape[1] + 1],
+        prefill_compile_on_miss=False,
+        prefill_unknown_shape_policy="eager",
+    )
+
+    assert profile["prefill_backend_used"] == "eager"
+    assert profile["prefill_shape_policy"] == "eager_unknown"
+    assert profile["prefill_shape_allowlist_hit"] is False
+    assert profile["prefill_shape_length"] == tie.shape[1]
+
+
+def test_run_talker_prefill_unknown_length_can_fail_before_compile(monkeypatch):
+    def fail_compile(*_args, **_kwargs):
+        raise AssertionError("unknown shapes must fail before compile")
+
+    monkeypatch.setattr(streaming, "_compile_talker_prefill", fail_compile)
+    tie, tam, tth, tpe = _dummy_prefill_inputs()
+
+    with pytest.raises(UnsupportedPrefillConfiguration, match="not in"):
+        _run_talker_prefill(
+            _dummy_streaming_model(),
+            tie,
+            tam,
+            tth,
+            tpe,
+            prefill_backend="compile_backend_eager",
+            prefill_mask_mode="skip",
+            prefill_compile_lengths=[tie.shape[1] + 1],
+            prefill_compile_on_miss=False,
+            prefill_unknown_shape_policy="error",
+        )
 
 
 def _verified_prefill_metadata():

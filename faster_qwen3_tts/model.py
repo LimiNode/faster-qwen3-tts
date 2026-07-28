@@ -8,7 +8,7 @@ CUDA graphs for 6-10x speedup.
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -19,7 +19,7 @@ from .prefill_compat import (
     normalize_prefill_compile_compat_mode,
     prefill_compile_compat_metadata,
 )
-from .streaming import clear_prefill_compile_cache
+from .streaming import _normalize_prefill_backend, clear_prefill_compile_cache
 from .utils import suppress_flash_attn_warning
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,11 @@ class FasterQwen3TTS:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         max_seq_len: int = 2048,
+        prefill_backend: Optional[str] = None,
         prefill_compile_compat_mode: Optional[str] = "none",
+        prefill_compile_lengths: Optional[Iterable[int]] = None,
+        prefill_compile_on_miss: bool = True,
+        prefill_unknown_shape_policy: str = "eager",
     ):
         self.model = base_model  # The qwen-tts Qwen3TTSModel instance
         self.predictor_graph = predictor_graph
@@ -51,11 +55,25 @@ class FasterQwen3TTS:
         self.device = device
         self.dtype = dtype
         self.max_seq_len = max_seq_len
+        self.prefill_backend = (
+            _normalize_prefill_backend(prefill_backend)
+            if prefill_backend is not None
+            else None
+        )
         self.prefill_compile_compat_mode = (
             normalize_prefill_compile_compat_mode(prefill_compile_compat_mode)
             if prefill_compile_compat_mode is not None
             else "none"
         )
+        self.prefill_compile_lengths = tuple(
+            sorted({int(value) for value in (prefill_compile_lengths or [])})
+        )
+        if any(value <= 0 for value in self.prefill_compile_lengths):
+            raise ValueError("prefill_compile_lengths values must be positive")
+        self.prefill_compile_on_miss = bool(prefill_compile_on_miss)
+        self.prefill_unknown_shape_policy = str(prefill_unknown_shape_policy or "eager")
+        if self.prefill_unknown_shape_policy not in {"eager", "error"}:
+            raise ValueError("prefill_unknown_shape_policy must be eager or error")
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
         self._voice_prompt_cache = {}  # Cache (ref_audio, ref_text) -> (vcp, ref_ids)
@@ -146,6 +164,17 @@ class FasterQwen3TTS:
             )
         return requested_mode
 
+    def _resolve_prefill_backend(self, requested_backend: Optional[str]) -> str:
+        if requested_backend is None:
+            return self.prefill_backend or "eager"
+        requested_backend = _normalize_prefill_backend(requested_backend)
+        if self.prefill_backend is not None and requested_backend != self.prefill_backend:
+            raise RuntimeError(
+                "prefill_backend is immutable for a loaded model: "
+                f"requested {requested_backend!r}, loaded {self.prefill_backend!r}."
+            )
+        return requested_backend
+
     @property
     def prefill_compile_compat_metadata(self) -> Dict[str, Any]:
         """Return immutable Talker prefill compatibility metadata."""
@@ -189,7 +218,11 @@ class FasterQwen3TTS:
         qwentts_ref_cache_dir: Optional[Union[str, Path]] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         local_files_only: bool = False,
+        prefill_backend: Optional[str] = None,
         prefill_compile_compat_mode: Optional[str] = "none",
+        prefill_compile_lengths: Optional[Iterable[int]] = None,
+        prefill_compile_on_miss: bool = True,
+        prefill_unknown_shape_policy: str = "eager",
     ):
         """
         Load Qwen3-TTS model and prepare CUDA graphs.
@@ -337,6 +370,10 @@ class FasterQwen3TTS:
             prefill_compile_compat_mode=(
                 normalized_prefill_compile_compat_mode or "none"
             ),
+            prefill_backend=prefill_backend,
+            prefill_compile_lengths=prefill_compile_lengths,
+            prefill_compile_on_miss=prefill_compile_on_miss,
+            prefill_unknown_shape_policy=prefill_unknown_shape_policy,
         )
 
     def warmup(self, prefill_len: int = 100) -> None:
@@ -1472,7 +1509,7 @@ class FasterQwen3TTS:
         profile_prefill: bool = False,
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
-        prefill_backend: str = "eager",
+        prefill_backend: Optional[str] = None,
         prefill_compile_compat_mode: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "custom_voice":
@@ -1480,6 +1517,7 @@ class FasterQwen3TTS:
         prefill_compile_compat_mode = self._resolve_prefill_compile_compat_mode(
             prefill_compile_compat_mode
         )
+        prefill_backend = self._resolve_prefill_backend(prefill_backend)
 
         self.model._validate_languages([language])
         self.model._validate_speakers([speaker])
@@ -1537,6 +1575,9 @@ class FasterQwen3TTS:
             profile_nvtx=profile_nvtx,
             prefill_backend=prefill_backend,
             prefill_compile_compat_mode=prefill_compile_compat_mode,
+            prefill_compile_lengths=self.prefill_compile_lengths,
+            prefill_compile_on_miss=self.prefill_compile_on_miss,
+            prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
@@ -1679,7 +1720,7 @@ class FasterQwen3TTS:
         profile_prefill: bool = False,
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
-        prefill_backend: str = "eager",
+        prefill_backend: Optional[str] = None,
         prefill_compile_compat_mode: Optional[str] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "voice_design":
@@ -1687,6 +1728,7 @@ class FasterQwen3TTS:
         prefill_compile_compat_mode = self._resolve_prefill_compile_compat_mode(
             prefill_compile_compat_mode
         )
+        prefill_backend = self._resolve_prefill_backend(prefill_backend)
 
         self.model._validate_languages([language])
 
@@ -1740,6 +1782,9 @@ class FasterQwen3TTS:
             profile_nvtx=profile_nvtx,
             prefill_backend=prefill_backend,
             prefill_compile_compat_mode=prefill_compile_compat_mode,
+            prefill_compile_lengths=self.prefill_compile_lengths,
+            prefill_compile_on_miss=self.prefill_compile_on_miss,
+            prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
