@@ -452,3 +452,78 @@ def test_prefill_compile_cache_tracks_ordinals_evictions_and_talker_entries():
     finally:
         streaming.configure_prefill_compile_cache(max_entries=64)
         streaming.clear_prefill_compile_cache()
+
+
+def test_prefill_compile_call_bucket_keeps_second_call_separate():
+    profile = {
+        "prefill_compiled_call_host_ms": 12.5,
+        "prefill_shape_call_ordinal": 2,
+        "prefill_compiled_call_1_host_ms": 0.0,
+        "prefill_compiled_call_2_host_ms": 0.0,
+        "prefill_compiled_call_3plus_host_ms": 0.0,
+        "prefill_compiled_first_call_ms": 0.0,
+        "prefill_compiled_warm_call_ms": 0.0,
+    }
+
+    streaming._record_prefill_compile_call_bucket(profile)
+
+    assert profile["prefill_compiled_call_2_host_ms"] == 12.5
+    assert profile["prefill_compiled_call_3plus_host_ms"] == 0.0
+    assert profile["prefill_compiled_warm_call_ms"] == 0.0
+
+
+def test_failed_prefill_compile_call_drops_callable_and_ordinal(monkeypatch):
+    streaming.clear_prefill_compile_cache()
+    try:
+        talker = CompleteTalker()
+        inputs = torch.randn(1, 2, 4)
+        trailing = torch.randn(1, 2, 4)
+        pad = torch.randn(4)
+
+        def failing_compile(_talker, _backend):
+            def failing_call(*_args, **_kwargs):
+                raise RuntimeError("compiled call failed")
+
+            return failing_call
+
+        monkeypatch.setattr(streaming, "_compile_talker_prefill", failing_compile)
+        monkeypatch.setattr(
+            streaming,
+            "_talker_prefill_eager",
+            lambda *args, **kwargs: object(),
+        )
+
+        _result, profile = streaming._run_talker_prefill(
+            talker,
+            inputs,
+            None,
+            trailing,
+            pad,
+            prefill_backend="compile_backend_eager",
+            prefill_mask_mode="skip",
+        )
+
+        stats = streaming.prefill_compile_cache_stats()
+        assert profile["prefill_compile_fallback"] is True
+        assert profile["prefill_shape_call_ordinal"] == 1
+        assert stats["entries"] == 0
+        assert stats["errors"] == 1
+        assert stats["talker_entries"] == {}
+
+        _result, retry_profile = streaming._run_talker_prefill(
+            talker,
+            inputs,
+            None,
+            trailing,
+            pad,
+            prefill_backend="compile_backend_eager",
+            prefill_mask_mode="skip",
+        )
+
+        retry_stats = streaming.prefill_compile_cache_stats()
+        assert retry_profile["prefill_compile_fallback"] is True
+        assert retry_profile["prefill_shape_call_ordinal"] == 0
+        assert retry_stats["entries"] == 0
+        assert retry_stats["errors"] == 1
+    finally:
+        streaming.clear_prefill_compile_cache()

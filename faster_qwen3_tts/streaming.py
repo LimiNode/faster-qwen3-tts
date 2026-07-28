@@ -10,7 +10,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
-from typing import Callable, Generator, Optional, Tuple
+from typing import Any, Callable, Generator, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -126,9 +126,14 @@ def _run_talker_prefill(
         "prefill_compile_cache_evictions": cache_stats["evictions"],
         "prefill_compile_cache_kind": "python_callable_lru",
         "prefill_compile_wrapper_create_ms": 0.0,
+        "prefill_compile_wrapper_create_host_ms": 0.0,
         "prefill_compiled_call_ms": 0.0,
+        "prefill_compiled_call_host_ms": 0.0,
         "prefill_compiled_first_call_ms": 0.0,
         "prefill_compiled_warm_call_ms": 0.0,
+        "prefill_compiled_call_1_host_ms": 0.0,
+        "prefill_compiled_call_2_host_ms": 0.0,
+        "prefill_compiled_call_3plus_host_ms": 0.0,
         "prefill_shape_call_ordinal": 0,
         **memory_before,
     }
@@ -189,6 +194,9 @@ def _run_talker_prefill(
                     (time.perf_counter() - compile_started) * 1000.0,
                     3,
                 )
+                profile["prefill_compile_wrapper_create_host_ms"] = profile[
+                    "prefill_compile_wrapper_create_ms"
+                ]
                 _prefill_compile_cache_store(cache_key, compiled)
             profile["prefill_shape_call_ordinal"] = _prefill_compile_next_call_ordinal(
                 cache_key
@@ -212,16 +220,13 @@ def _run_talker_prefill(
                 (time.perf_counter() - call_started) * 1000.0,
                 3,
             )
-            if profile["prefill_shape_call_ordinal"] == 1:
-                profile["prefill_compiled_first_call_ms"] = profile[
-                    "prefill_compiled_call_ms"
-                ]
-            else:
-                profile["prefill_compiled_warm_call_ms"] = profile[
-                    "prefill_compiled_call_ms"
-                ]
+            profile["prefill_compiled_call_host_ms"] = profile[
+                "prefill_compiled_call_ms"
+            ]
+            _record_prefill_compile_call_bucket(profile)
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
+        _prefill_compile_cache_drop(cache_key)
         _prefill_compile_error_store(cache_key, message)
         profile["prefill_compile_fallback"] = True
         profile["prefill_compile_error"] = message
@@ -242,7 +247,7 @@ def _run_talker_prefill(
     return out, profile
 
 
-def prefill_compile_cache_stats() -> dict[str, int]:
+def prefill_compile_cache_stats() -> dict[str, Any]:
     with _PREFILL_COMPILE_CACHE_LOCK:
         return {
             "entries": len(_PREFILL_COMPILE_CACHE),
@@ -253,7 +258,7 @@ def prefill_compile_cache_stats() -> dict[str, int]:
         }
 
 
-def clear_prefill_compile_cache(talker=None) -> dict[str, int]:
+def clear_prefill_compile_cache(talker=None) -> dict[str, Any]:
     talker_id = id(talker) if talker is not None else None
     removed_entries = 0
     removed_errors = 0
@@ -274,7 +279,7 @@ def clear_prefill_compile_cache(talker=None) -> dict[str, int]:
     }
 
 
-def configure_prefill_compile_cache(*, max_entries: int | None = None) -> dict[str, int]:
+def configure_prefill_compile_cache(*, max_entries: int | None = None) -> dict[str, Any]:
     global _PREFILL_COMPILE_CACHE_MAX_ENTRIES
     with _PREFILL_COMPILE_CACHE_LOCK:
         if max_entries is not None:
@@ -298,6 +303,13 @@ def _prefill_compile_cache_store(cache_key: tuple, compiled) -> None:
         _PREFILL_COMPILE_CACHE[cache_key] = compiled
         _PREFILL_COMPILE_CACHE.move_to_end(cache_key)
         _prefill_compile_evict_locked()
+
+
+def _prefill_compile_cache_drop(cache_key: tuple) -> bool:
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        removed = _PREFILL_COMPILE_CACHE.pop(cache_key, None) is not None
+        _PREFILL_COMPILE_CALL_COUNTS.pop(cache_key, None)
+        return removed
 
 
 def _prefill_compile_error(cache_key: tuple) -> str | None:
@@ -345,6 +357,19 @@ def _prefill_compile_talker_entries_locked() -> dict[int, int]:
         if talker_id is not None:
             counts[talker_id] = counts.get(talker_id, 0) + 1
     return counts
+
+
+def _record_prefill_compile_call_bucket(profile: dict[str, Any]) -> None:
+    duration_ms = profile["prefill_compiled_call_host_ms"]
+    ordinal = profile["prefill_shape_call_ordinal"]
+    if ordinal == 1:
+        profile["prefill_compiled_call_1_host_ms"] = duration_ms
+        profile["prefill_compiled_first_call_ms"] = duration_ms
+    elif ordinal == 2:
+        profile["prefill_compiled_call_2_host_ms"] = duration_ms
+    else:
+        profile["prefill_compiled_call_3plus_host_ms"] = duration_ms
+        profile["prefill_compiled_warm_call_ms"] = duration_ms
 
 
 def _cuda_memory_stats(prefix: str) -> dict[str, int]:
