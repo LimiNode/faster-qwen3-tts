@@ -418,3 +418,37 @@ def test_faster_wrapper_close_clears_prefill_compile_cache():
 
     assert streaming.prefill_compile_cache_stats()["entries"] == 1
     streaming.clear_prefill_compile_cache()
+
+
+def test_prefill_compile_cache_tracks_ordinals_evictions_and_talker_entries():
+    streaming.clear_prefill_compile_cache()
+    original_stats = streaming.configure_prefill_compile_cache(max_entries=64)
+    assert original_stats["max_entries"] == 64
+    try:
+        first_talker = CompleteTalker()
+        second_talker = CompleteTalker()
+        streaming.configure_prefill_compile_cache(max_entries=2)
+        first_key = (id(first_talker), "shape-a")
+        second_key = (id(first_talker), "shape-b")
+        third_key = (id(second_talker), "shape-c")
+
+        streaming._prefill_compile_cache_store(first_key, object())
+        streaming._prefill_compile_cache_store(second_key, object())
+        assert streaming._prefill_compile_next_call_ordinal(first_key) == 1
+        assert streaming._prefill_compile_next_call_ordinal(first_key) == 2
+
+        stats = streaming.prefill_compile_cache_stats()
+        assert stats["entries"] == 2
+        assert stats["talker_entries"][id(first_talker)] == 2
+
+        evictions_before = stats["evictions"]
+        streaming._prefill_compile_cache_store(third_key, object())
+        stats = streaming.prefill_compile_cache_stats()
+        assert stats["entries"] == 2
+        assert stats["evictions"] == evictions_before + 1
+        assert stats["talker_entries"][id(first_talker)] == 1
+        assert stats["talker_entries"][id(second_talker)] == 1
+        assert streaming._prefill_compile_next_call_ordinal(first_key) == 1
+    finally:
+        streaming.configure_prefill_compile_cache(max_entries=64)
+        streaming.clear_prefill_compile_cache()

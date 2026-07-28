@@ -42,6 +42,8 @@ _PREFILL_BACKEND_ALIASES = {
 _PREFILL_COMPILE_CACHE_MAX_ENTRIES = 64
 _PREFILL_COMPILE_CACHE = OrderedDict()
 _PREFILL_COMPILE_ERRORS = OrderedDict()
+_PREFILL_COMPILE_CALL_COUNTS = {}
+_PREFILL_COMPILE_EVICTIONS = 0
 _PREFILL_COMPILE_CACHE_LOCK = threading.RLock()
 
 
@@ -105,6 +107,7 @@ def _run_talker_prefill(
         input_metadata=input_metadata,
     )
     cache_stats = prefill_compile_cache_stats()
+    memory_before = _cuda_memory_stats("prefill_cuda_memory_before")
     profile = {
         "prefill_backend_requested": prefill_backend,
         "prefill_backend_used": "eager",
@@ -115,8 +118,19 @@ def _run_talker_prefill(
         "prefill_compile_compat_mode": prefill_compile_compat_mode,
         "prefill_compile_cache_hit": False,
         "prefill_compile_cache_entries": cache_stats["entries"],
+        "prefill_compile_cache_talker_entries": cache_stats["talker_entries"].get(
+            id(talker),
+            0,
+        ),
         "prefill_compile_cache_max_entries": cache_stats["max_entries"],
-        "prefill_compile_wall_ms": 0.0,
+        "prefill_compile_cache_evictions": cache_stats["evictions"],
+        "prefill_compile_cache_kind": "python_callable_lru",
+        "prefill_compile_wrapper_create_ms": 0.0,
+        "prefill_compiled_call_ms": 0.0,
+        "prefill_compiled_first_call_ms": 0.0,
+        "prefill_compiled_warm_call_ms": 0.0,
+        "prefill_shape_call_ordinal": 0,
+        **memory_before,
     }
     if prefill_backend == "eager":
         return (
@@ -171,14 +185,22 @@ def _run_talker_prefill(
             if compiled is None:
                 compile_started = time.perf_counter()
                 compiled = _compile_talker_prefill(talker, prefill_backend)
-                profile["prefill_compile_wall_ms"] = round(
+                profile["prefill_compile_wrapper_create_ms"] = round(
                     (time.perf_counter() - compile_started) * 1000.0,
                     3,
                 )
                 _prefill_compile_cache_store(cache_key, compiled)
+            profile["prefill_shape_call_ordinal"] = _prefill_compile_next_call_ordinal(
+                cache_key
+            )
             cache_stats = prefill_compile_cache_stats()
             profile["prefill_compile_cache_entries"] = cache_stats["entries"]
+            profile["prefill_compile_cache_talker_entries"] = (
+                cache_stats["talker_entries"].get(id(talker), 0)
+            )
             profile["prefill_compile_cache_max_entries"] = cache_stats["max_entries"]
+            profile["prefill_compile_cache_evictions"] = cache_stats["evictions"]
+            call_started = time.perf_counter()
             out = compiled(
                 talker_input_embeds,
                 prefill_attention_mask,
@@ -186,6 +208,18 @@ def _run_talker_prefill(
                 tts_pad_embed,
                 skip_prefill_causal_mask,
             )
+            profile["prefill_compiled_call_ms"] = round(
+                (time.perf_counter() - call_started) * 1000.0,
+                3,
+            )
+            if profile["prefill_shape_call_ordinal"] == 1:
+                profile["prefill_compiled_first_call_ms"] = profile[
+                    "prefill_compiled_call_ms"
+                ]
+            else:
+                profile["prefill_compiled_warm_call_ms"] = profile[
+                    "prefill_compiled_call_ms"
+                ]
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         _prefill_compile_error_store(cache_key, message)
@@ -204,6 +238,7 @@ def _run_talker_prefill(
         )
 
     profile["prefill_backend_used"] = prefill_backend
+    profile.update(_cuda_memory_stats("prefill_cuda_memory_after"))
     return out, profile
 
 
@@ -213,6 +248,8 @@ def prefill_compile_cache_stats() -> dict[str, int]:
             "entries": len(_PREFILL_COMPILE_CACHE),
             "errors": len(_PREFILL_COMPILE_ERRORS),
             "max_entries": _PREFILL_COMPILE_CACHE_MAX_ENTRIES,
+            "evictions": _PREFILL_COMPILE_EVICTIONS,
+            "talker_entries": _prefill_compile_talker_entries_locked(),
         }
 
 
@@ -224,6 +261,7 @@ def clear_prefill_compile_cache(talker=None) -> dict[str, int]:
         for key in list(_PREFILL_COMPILE_CACHE):
             if talker_id is None or _cache_key_talker_id(key) == talker_id:
                 del _PREFILL_COMPILE_CACHE[key]
+                _PREFILL_COMPILE_CALL_COUNTS.pop(key, None)
                 removed_entries += 1
         for key in list(_PREFILL_COMPILE_ERRORS):
             if talker_id is None or _cache_key_talker_id(key) == talker_id:
@@ -234,6 +272,17 @@ def clear_prefill_compile_cache(talker=None) -> dict[str, int]:
         "removed_errors": removed_errors,
         **prefill_compile_cache_stats(),
     }
+
+
+def configure_prefill_compile_cache(*, max_entries: int | None = None) -> dict[str, int]:
+    global _PREFILL_COMPILE_CACHE_MAX_ENTRIES
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        if max_entries is not None:
+            if max_entries <= 0:
+                raise ValueError("prefill compile cache max_entries must be positive")
+            _PREFILL_COMPILE_CACHE_MAX_ENTRIES = int(max_entries)
+            _prefill_compile_evict_locked()
+        return prefill_compile_cache_stats()
 
 
 def _prefill_compile_cache_get(cache_key: tuple):
@@ -248,8 +297,7 @@ def _prefill_compile_cache_store(cache_key: tuple, compiled) -> None:
     with _PREFILL_COMPILE_CACHE_LOCK:
         _PREFILL_COMPILE_CACHE[cache_key] = compiled
         _PREFILL_COMPILE_CACHE.move_to_end(cache_key)
-        while len(_PREFILL_COMPILE_CACHE) > _PREFILL_COMPILE_CACHE_MAX_ENTRIES:
-            _PREFILL_COMPILE_CACHE.popitem(last=False)
+        _prefill_compile_evict_locked()
 
 
 def _prefill_compile_error(cache_key: tuple) -> str | None:
@@ -273,6 +321,43 @@ def _cache_key_talker_id(cache_key: tuple) -> int | None:
         return None
     value = cache_key[0]
     return value if isinstance(value, int) else None
+
+
+def _prefill_compile_next_call_ordinal(cache_key: tuple) -> int:
+    with _PREFILL_COMPILE_CACHE_LOCK:
+        ordinal = _PREFILL_COMPILE_CALL_COUNTS.get(cache_key, 0) + 1
+        _PREFILL_COMPILE_CALL_COUNTS[cache_key] = ordinal
+        return ordinal
+
+
+def _prefill_compile_evict_locked() -> None:
+    global _PREFILL_COMPILE_EVICTIONS
+    while len(_PREFILL_COMPILE_CACHE) > _PREFILL_COMPILE_CACHE_MAX_ENTRIES:
+        key, _value = _PREFILL_COMPILE_CACHE.popitem(last=False)
+        _PREFILL_COMPILE_CALL_COUNTS.pop(key, None)
+        _PREFILL_COMPILE_EVICTIONS += 1
+
+
+def _prefill_compile_talker_entries_locked() -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for key in _PREFILL_COMPILE_CACHE:
+        talker_id = _cache_key_talker_id(key)
+        if talker_id is not None:
+            counts[talker_id] = counts.get(talker_id, 0) + 1
+    return counts
+
+
+def _cuda_memory_stats(prefix: str) -> dict[str, int]:
+    if not torch.cuda.is_available():
+        return {}
+    try:
+        return {
+            f"{prefix}_allocated_bytes": int(torch.cuda.memory_allocated()),
+            f"{prefix}_reserved_bytes": int(torch.cuda.memory_reserved()),
+            f"{prefix}_max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        }
+    except Exception:
+        return {}
 
 
 def _normalize_prefill_mask_mode(prefill_mask_mode: str) -> str:
