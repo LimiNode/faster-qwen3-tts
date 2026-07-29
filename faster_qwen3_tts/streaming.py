@@ -124,6 +124,33 @@ def _normalize_prefill_compile_lengths(
     return normalized
 
 
+def _normalize_chunk_schedule(
+    chunk_schedule: Optional[Iterable[int]],
+) -> tuple[int, ...]:
+    """Return a validated finite prefix of per-chunk emission sizes."""
+
+    if chunk_schedule is None:
+        return ()
+    normalized = tuple(int(value) for value in chunk_schedule)
+    if any(value <= 0 for value in normalized):
+        raise ValueError("chunk_schedule values must be positive")
+    return normalized
+
+
+def _chunk_target_steps(
+    chunk_size: int,
+    chunk_schedule: tuple[int, ...],
+    chunk_index: int,
+) -> int:
+    """Select the scheduled size or preserve the legacy fixed chunk size."""
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if not chunk_schedule:
+        return chunk_size
+    return chunk_schedule[min(chunk_index, len(chunk_schedule) - 1)]
+
+
 def _run_talker_prefill(
     talker,
     talker_input_embeds: torch.Tensor,
@@ -763,6 +790,7 @@ def fast_generate_streaming(
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
+    chunk_schedule: Optional[Iterable[int]] = None,
     input_metadata: Optional[dict] = None,
     termination_sink: Optional[dict] = None,
     profile_prefill: bool = False,
@@ -778,9 +806,9 @@ def fast_generate_streaming(
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
 
-    Yields (codec_chunk, timing_info) tuples every chunk_size steps.
+    Yields (codec_chunk, timing_info) tuples every scheduled chunk size.
     codec_chunk: [chunk_steps, 16] tensor of codec IDs.
-    The final chunk may be shorter than chunk_size.
+    The final chunk may be shorter than its scheduled size.
     """
     eos_id = config.codec_eos_token_id
     vocab_size = config.vocab_size
@@ -804,6 +832,7 @@ def fast_generate_streaming(
     unknown_shape_policy = _normalize_prefill_unknown_shape_policy(
         prefill_unknown_shape_policy
     )
+    normalized_chunk_schedule = _normalize_chunk_schedule(chunk_schedule)
     if str(prefill_mask_mode or "auto").strip().lower() == "auto":
         prefill_mask_mode = select_prefill_mask_mode(input_metadata)
     else:
@@ -1067,8 +1096,14 @@ def fast_generate_streaming(
         gen_step += 1
         decode_phase_timer.end("ar_state_update", state_phase)
 
-        # --- Yield chunk when buffer is full ---
-        if len(chunk_buffer) >= chunk_size:
+        # The optional schedule lowers time to first PCM without permanently
+        # paying the smaller-chunk decode overhead in steady state.
+        chunk_target_steps = _chunk_target_steps(
+            chunk_size,
+            normalized_chunk_schedule,
+            chunk_count,
+        )
+        if len(chunk_buffer) >= chunk_target_steps:
             torch.cuda.synchronize()
             # This chunk's tail entry hasn't been EOS-checked yet (that happens
             # at the top of the next iteration); validate it now that we're synced.
@@ -1105,6 +1140,13 @@ def fast_generate_streaming(
                     {
                         "chunk_index": chunk_count,
                         "chunk_steps": len(chunk_buffer),
+                        "chunk_target_steps": chunk_target_steps,
+                        "chunk_schedule_index": min(
+                            chunk_count,
+                            len(normalized_chunk_schedule) - 1,
+                        )
+                        if normalized_chunk_schedule
+                        else None,
                         "prefill_ms": t_prefill * 1000 if chunk_count == 0 else 0,
                         "decode_ms": chunk_decode_time * 1000,
                         "total_steps_so_far": total_steps,
@@ -1166,6 +1208,17 @@ def fast_generate_streaming(
                 {
                     "chunk_index": chunk_count,
                     "chunk_steps": len(chunk_buffer),
+                    "chunk_target_steps": _chunk_target_steps(
+                        chunk_size,
+                        normalized_chunk_schedule,
+                        chunk_count,
+                    ),
+                    "chunk_schedule_index": min(
+                        chunk_count,
+                        len(normalized_chunk_schedule) - 1,
+                    )
+                    if normalized_chunk_schedule
+                    else None,
                     "prefill_ms": t_prefill * 1000 if chunk_count == 0 else 0,
                     "decode_ms": chunk_decode_time * 1000,
                     "total_steps_so_far": total_steps,

@@ -1548,6 +1548,7 @@ class FasterQwen3TTS:
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
+        chunk_schedule: Optional[Iterable[int]] = None,
         profile_prefill: bool = False,
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
@@ -1590,7 +1591,10 @@ class FasterQwen3TTS:
         speech_tokenizer = m.speech_tokenizer
 
         context_frames = 25
-        min_calibration_frames = max(context_frames, chunk_size)
+        min_calibration_frames = max(
+            context_frames,
+            *(chunk_schedule or (chunk_size,)),
+        )
         all_codes = []
         codec_hasher = hashlib.sha256() if self.collect_generation_trace else None
         codec_frame_count = 0
@@ -1615,6 +1619,7 @@ class FasterQwen3TTS:
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
+            chunk_schedule=chunk_schedule,
             input_metadata=input_metadata,
             termination_sink=termination_trace,
             profile_prefill=profile_prefill,
@@ -1851,6 +1856,7 @@ class FasterQwen3TTS:
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
+        chunk_schedule: Optional[Iterable[int]] = None,
         profile_prefill: bool = False,
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
@@ -1889,7 +1895,10 @@ class FasterQwen3TTS:
         speech_tokenizer = m.speech_tokenizer
 
         context_frames = 25
-        min_calibration_frames = max(context_frames, chunk_size)
+        min_calibration_frames = max(
+            context_frames,
+            *(chunk_schedule or (chunk_size,)),
+        )
         all_codes = []
         prev_audio_len = 0
         samples_per_frame = None
@@ -1911,6 +1920,7 @@ class FasterQwen3TTS:
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
+            chunk_schedule=chunk_schedule,
             input_metadata=input_metadata,
             profile_prefill=profile_prefill,
             profile_nvtx=profile_nvtx,

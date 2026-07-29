@@ -71,6 +71,31 @@ def test_terminal_sink_is_complete_without_final_audio_chunk():
     }
 
 
+def test_chunk_schedule_uses_its_last_size_for_steady_state():
+    schedule = streaming._normalize_chunk_schedule([6, 8, 12])
+
+    assert [streaming._chunk_target_steps(8, schedule, index) for index in range(5)] == [
+        6,
+        8,
+        12,
+        12,
+        12,
+    ]
+
+
+def test_empty_chunk_schedule_preserves_fixed_chunk_size():
+    schedule = streaming._normalize_chunk_schedule(None)
+
+    assert streaming._chunk_target_steps(8, schedule, 0) == 8
+    assert streaming._chunk_target_steps(8, schedule, 4) == 8
+
+
+@pytest.mark.parametrize("schedule", ([0], [-1], [6, 0, 12]))
+def test_chunk_schedule_rejects_non_positive_sizes(schedule):
+    with pytest.raises(ValueError, match="chunk_schedule values must be positive"):
+        streaming._normalize_chunk_schedule(schedule)
+
+
 def test_faster_wrapper_selects_greedy_predictor_graph():
     sampling_graph = types.SimpleNamespace(do_sample=True)
     greedy_graph = types.SimpleNamespace(do_sample=False)
