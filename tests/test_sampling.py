@@ -102,6 +102,26 @@ def test_chunk_schedule_normalizes_a_generator_once():
     ]
 
 
+def test_route_aware_chunk_schedule_uses_the_observed_prefill_route():
+    compiled, compiled_reason = streaming._select_chunk_schedule_for_prefill_route(
+        (8,),
+        (6, 8, 12),
+        (8,),
+        {"prefill_shape_policy": "compiled_allowlist"},
+    )
+    eager, eager_reason = streaming._select_chunk_schedule_for_prefill_route(
+        (8,),
+        (6, 8, 12),
+        (8,),
+        {"prefill_shape_policy": "eager_unknown"},
+    )
+
+    assert compiled == (6, 8, 12)
+    assert compiled_reason == "compiled_allowlist"
+    assert eager == (8,)
+    assert eager_reason == "eager_unknown"
+
+
 @pytest.mark.parametrize("schedule", ([0], [-1], [6, 0, 12]))
 def test_chunk_schedule_rejects_non_positive_sizes(schedule):
     with pytest.raises(ValueError, match="chunk_schedule values must be positive"):

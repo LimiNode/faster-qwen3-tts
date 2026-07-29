@@ -155,6 +155,26 @@ def _normalize_chunk_schedule(
     return normalized
 
 
+def _select_chunk_schedule_for_prefill_route(
+    default_schedule: tuple[int, ...],
+    compiled_schedule: Optional[Iterable[int]],
+    eager_schedule: Optional[Iterable[int]],
+    backend_profile: dict,
+) -> tuple[tuple[int, ...], str]:
+    """Select an emission schedule after the real prefill route is known."""
+
+    route = backend_profile.get("prefill_shape_policy")
+    if route == "compiled_allowlist":
+        schedule = _normalize_chunk_schedule(compiled_schedule)
+        if schedule:
+            return schedule, "compiled_allowlist"
+    elif route == "eager_unknown":
+        schedule = _normalize_chunk_schedule(eager_schedule)
+        if schedule:
+            return schedule, "eager_unknown"
+    return default_schedule, "default"
+
+
 def _chunk_target_steps(
     chunk_size: int,
     chunk_schedule: tuple[int, ...],
@@ -827,6 +847,8 @@ def fast_generate_streaming(
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
     chunk_schedule: Optional[Iterable[int]] = None,
+    compiled_chunk_schedule: Optional[Iterable[int]] = None,
+    eager_chunk_schedule: Optional[Iterable[int]] = None,
     input_metadata: Optional[dict] = None,
     termination_sink: Optional[dict] = None,
     profile_prefill: bool = False,
@@ -909,6 +931,15 @@ def fast_generate_streaming(
         time.perf_counter() - forward_started
     ) * 1000
     prefill_profile.update(backend_profile)
+    normalized_chunk_schedule, schedule_decision = _select_chunk_schedule_for_prefill_route(
+        normalized_chunk_schedule,
+        compiled_chunk_schedule,
+        eager_chunk_schedule,
+        backend_profile,
+    )
+    if input_metadata is not None:
+        input_metadata["selected_chunk_schedule"] = list(normalized_chunk_schedule)
+        input_metadata["chunk_schedule_decision"] = schedule_decision
     prefill_events.record("after_forward")
 
     talker_past_kv = out.past_key_values
