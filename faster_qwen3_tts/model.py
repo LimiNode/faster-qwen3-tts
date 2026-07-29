@@ -5,6 +5,7 @@ Wrapper class that provides a Qwen3-TTS API while using
 CUDA graphs for 6-10x speedup.
 """
 
+import hashlib
 import logging
 import time
 from pathlib import Path
@@ -79,6 +80,8 @@ class FasterQwen3TTS:
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
         self._voice_prompt_cache = {}  # Cache (ref_audio, ref_text) -> (vcp, ref_ids)
+        self.collect_generation_trace = False
+        self.last_generation_trace: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _get_speech_tokenizer(base_model):
@@ -407,6 +410,40 @@ class FasterQwen3TTS:
             clear_prefill_compile_cache(self.model.model.talker)
         except Exception:
             logger.debug("Failed to clear prefill compile cache", exc_info=True)
+
+    def reset_after_partial_generation(self) -> Dict[str, Any]:
+        """Reset request-local graph state after a caller closes a partial stream.
+
+        This deliberately preserves captured CUDA graphs, generation-mask tables,
+        and compiled prefill cache entries. Callers must close the active streaming
+        generator before invoking this method.
+        """
+        talker_reset = getattr(self.talker_graph, "reset", None)
+        if not callable(talker_reset):
+            raise RuntimeError("TalkerGraph does not expose reset()")
+
+        predictor_reset_count = 0
+        for predictor_graph in (
+            self.predictor_graph,
+            self.predictor_graph_greedy,
+        ):
+            if predictor_graph is None:
+                continue
+            predictor_reset = getattr(predictor_graph, "reset", None)
+            if not callable(predictor_reset):
+                raise RuntimeError("PredictorGraph does not expose reset()")
+            predictor_reset()
+            predictor_reset_count += 1
+
+        talker_reset(0)
+        return {
+            "reset_api_version": 1,
+            "talker_graph_reset": True,
+            "predictor_graphs_reset": predictor_reset_count,
+            "compiled_prefill_cache_preserved": True,
+            "cuda_graphs_preserved": True,
+            "generation_mask_cache_preserved": True,
+        }
 
     def generate(
         self,
@@ -1554,6 +1591,9 @@ class FasterQwen3TTS:
         context_frames = 25
         min_calibration_frames = max(context_frames, chunk_size)
         all_codes = []
+        codec_hasher = hashlib.sha256() if self.collect_generation_trace else None
+        codec_frame_count = 0
+        last_timing: Optional[dict] = None
         prev_audio_len = 0
         samples_per_frame = None
 
@@ -1588,6 +1628,16 @@ class FasterQwen3TTS:
             context_started = time.perf_counter()
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
+            if codec_hasher is not None:
+                codec_bytes = (
+                    codec_chunk.detach()
+                    .to(device="cpu", dtype=torch.int32)
+                    .contiguous()
+                    .numpy()
+                    .tobytes()
+                )
+                codec_hasher.update(codec_bytes)
+                codec_frame_count += int(n_new)
             all_flat = torch.cat(all_codes, dim=0)
             n_total = all_flat.shape[0]
 
@@ -1687,7 +1737,20 @@ class FasterQwen3TTS:
                         speech_tokenizer_decode_gpu_ms
                     )
 
+            last_timing = timing
             yield new_audio, sr, timing
+
+        if codec_hasher is not None:
+            timing = last_timing or {}
+            self.last_generation_trace = {
+                "codec_sha256": codec_hasher.hexdigest(),
+                "codec_frame_count": codec_frame_count,
+                "termination_reason": timing.get("termination_reason"),
+                "terminal_token_id": timing.get("terminal_token_id"),
+                "terminal_step_index": timing.get("terminal_step_index"),
+                "generated_steps": timing.get("generated_steps"),
+                "emitted_steps": timing.get("emitted_steps"),
+            }
 
     @torch.inference_mode()
     def generate_voice_design(

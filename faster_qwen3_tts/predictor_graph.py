@@ -214,3 +214,7 @@ class PredictorGraph:
         # before any attention reads them, so stale values are never attended.
         self.graph.replay()
         return self.output_tokens.clone()
+
+    def reset(self) -> None:
+        """Clear request-local cache metadata without recapturing the CUDA graph."""
+        self.static_cache.reset()

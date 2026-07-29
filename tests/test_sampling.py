@@ -61,6 +61,34 @@ def test_faster_wrapper_selects_greedy_predictor_graph():
         model._select_predictor_graph(False)
 
 
+def test_faster_wrapper_resets_partial_generation_graph_state():
+    class ResetGraph:
+        def __init__(self):
+            self.reset_calls = []
+
+        def reset(self, *args):
+            self.reset_calls.append(args)
+
+    model = FasterQwen3TTS.__new__(FasterQwen3TTS)
+    model.talker_graph = ResetGraph()
+    model.predictor_graph = ResetGraph()
+    model.predictor_graph_greedy = ResetGraph()
+
+    metadata = model.reset_after_partial_generation()
+
+    assert model.talker_graph.reset_calls == [(0,)]
+    assert model.predictor_graph.reset_calls == [()]
+    assert model.predictor_graph_greedy.reset_calls == [()]
+    assert metadata == {
+        "reset_api_version": 1,
+        "talker_graph_reset": True,
+        "predictor_graphs_reset": 2,
+        "compiled_prefill_cache_preserved": True,
+        "cuda_graphs_preserved": True,
+        "generation_mask_cache_preserved": True,
+    }
+
+
 def test_faster_wrapper_uses_loaded_prefill_compile_compat_mode_by_default():
     model = FasterQwen3TTS.__new__(FasterQwen3TTS)
     model.prefill_compile_compat_mode = "strict_bf16_sdpa_v1"
