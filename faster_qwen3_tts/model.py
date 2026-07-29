@@ -1549,6 +1549,7 @@ class FasterQwen3TTS:
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
         chunk_schedule: Optional[Iterable[int]] = None,
+        overlap_samples: int = 0,
         profile_prefill: bool = False,
         profile_nvtx: bool = False,
         profile_request_role: Optional[str] = None,
@@ -1598,6 +1599,7 @@ class FasterQwen3TTS:
         codec_hasher = hashlib.sha256() if self.collect_generation_trace else None
         codec_frame_count = 0
         termination_trace: dict = {}
+        previous_tail: Optional[np.ndarray] = None
 
         for codec_chunk, timing in fast_generate_streaming(
             talker=talker,
@@ -1696,6 +1698,17 @@ class FasterQwen3TTS:
             audio_slice_started = time.perf_counter()
             step_samples = int(n_new) * samples_per_frame
             new_audio = audio[-step_samples:] if step_samples > 0 else audio
+            if previous_tail is not None and overlap_samples > 0 and len(new_audio) > 0:
+                overlap = min(overlap_samples, len(previous_tail), len(new_audio))
+                if overlap > 0:
+                    fade = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
+                    new_audio = new_audio.copy()
+                    new_audio[:overlap] = (
+                        previous_tail[-overlap:] * (1.0 - fade)
+                        + new_audio[:overlap] * fade
+                    )
+            if overlap_samples > 0 and len(new_audio) > 0:
+                previous_tail = new_audio[-overlap_samples:].copy()
 
             audio_slice_ms = (time.perf_counter() - audio_slice_started) * 1000
             codec_wrapper_wall_ms = (time.perf_counter() - wrapper_started) * 1000
