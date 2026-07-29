@@ -399,25 +399,50 @@ def test_run_talker_prefill_compiles_allowlisted_length(monkeypatch):
 
         return compiled
 
-    monkeypatch.setattr(streaming, "_compile_talker_prefill", fake_compile)
-    tie, tam, tth, tpe = _dummy_prefill_inputs()
-    _out, profile = _run_talker_prefill(
-        DummyTalker(),
-        tie,
-        tam,
-        tth,
-        tpe,
-        prefill_backend="compile_backend_eager",
-        prefill_mask_mode="skip",
-        prefill_compile_lengths=[tie.shape[1]],
-        prefill_compile_on_miss=False,
-        prefill_unknown_shape_policy="eager",
-    )
+    streaming.clear_prefill_compile_cache()
+    try:
+        monkeypatch.setattr(streaming, "_compile_talker_prefill", fake_compile)
+        tie, tam, tth, tpe = _dummy_prefill_inputs()
+        talker = DummyTalker()
+        _out, profile = _run_talker_prefill(
+            talker,
+            tie,
+            tam,
+            tth,
+            tpe,
+            prefill_backend="compile_backend_eager",
+            prefill_mask_mode="skip",
+            prefill_compile_lengths=[tie.shape[1]],
+            prefill_compile_on_miss=False,
+            prefill_unknown_shape_policy="eager",
+        )
+        _out, replay_profile = _run_talker_prefill(
+            talker,
+            tie,
+            tam,
+            tth,
+            tpe,
+            prefill_backend="compile_backend_eager",
+            prefill_mask_mode="skip",
+            prefill_compile_lengths=[tie.shape[1]],
+            prefill_compile_on_miss=False,
+            prefill_unknown_shape_policy="eager",
+        )
 
-    assert len(compile_calls) == 1
-    assert profile["prefill_backend_used"] == "compile_backend_eager"
-    assert profile["prefill_shape_policy"] == "compiled_allowlist"
-    assert profile["prefill_shape_allowlist_hit"] is True
+        assert len(compile_calls) == 1
+        assert profile["prefill_backend_used"] == "compile_backend_eager"
+        assert profile["prefill_shape_policy"] == "compiled_allowlist"
+        assert profile["prefill_shape_allowlist_hit"] is True
+        assert profile["prefill_compile_attempted"] is True
+        assert profile["prefill_compile_attempt_count"] == 1
+        assert profile["prefill_compile_cache_entries_delta"] == 1
+        assert replay_profile["prefill_compile_cache_hit"] is True
+        assert replay_profile["prefill_compile_attempted"] is False
+        assert replay_profile["prefill_compile_attempt_count"] == 0
+        assert replay_profile["prefill_compile_cache_entries_delta"] == 0
+        assert replay_profile["prefill_compile_cache_evictions_delta"] == 0
+    finally:
+        streaming.clear_prefill_compile_cache()
 
 
 def test_run_talker_prefill_unknown_length_uses_eager_before_compile(monkeypatch):
@@ -453,6 +478,11 @@ def test_run_talker_prefill_unknown_length_uses_eager_before_compile(monkeypatch
     assert profile["prefill_shape_policy"] == "eager_unknown"
     assert profile["prefill_shape_allowlist_hit"] is False
     assert profile["prefill_shape_length"] == tie.shape[1]
+    assert profile["prefill_compile_attempted"] is False
+    assert profile["prefill_compile_attempt_count"] == 0
+    assert profile["prefill_compile_cache_entries_delta"] == 0
+    assert profile["prefill_compile_cache_evictions_delta"] == 0
+    assert profile["prefill_dynamo_unique_graphs_delta"] == 0
 
 
 def test_run_talker_prefill_unknown_length_can_fail_before_compile(monkeypatch):
