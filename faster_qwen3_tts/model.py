@@ -423,19 +423,20 @@ class FasterQwen3TTS:
             raise RuntimeError("TalkerGraph does not expose reset()")
 
         predictor_reset_count = 0
-        for predictor_graph in (
-            self.predictor_graph,
-            self.predictor_graph_greedy,
-        ):
-            if predictor_graph is None:
-                continue
-            predictor_reset = getattr(predictor_graph, "reset", None)
-            if not callable(predictor_reset):
-                raise RuntimeError("PredictorGraph does not expose reset()")
-            predictor_reset()
-            predictor_reset_count += 1
+        with torch.inference_mode():
+            for predictor_graph in (
+                self.predictor_graph,
+                self.predictor_graph_greedy,
+            ):
+                if predictor_graph is None:
+                    continue
+                predictor_reset = getattr(predictor_graph, "reset", None)
+                if not callable(predictor_reset):
+                    raise RuntimeError("PredictorGraph does not expose reset()")
+                predictor_reset()
+                predictor_reset_count += 1
 
-        talker_reset(0)
+            talker_reset(0)
         return {
             "reset_api_version": 1,
             "talker_graph_reset": True,
