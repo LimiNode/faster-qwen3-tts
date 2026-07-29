@@ -60,13 +60,13 @@ def test_terminal_sink_is_complete_without_final_audio_chunk():
     streaming._publish_termination_sink(
         sink,
         termination,
-        generated_steps=14,
+        generated_steps=13,
         emitted_steps=13,
     )
 
     assert sink == {
         **termination,
-        "generated_steps": 14,
+        "generated_steps": 13,
         "emitted_steps": 13,
     }
 

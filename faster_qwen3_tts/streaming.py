@@ -1417,7 +1417,7 @@ def _publish_termination_sink(
     generated_steps: int,
     emitted_steps: int,
 ) -> None:
-    """Expose terminal accounting even when no final audio chunk is yielded."""
+    """Expose completed non-EOS codec-frame accounting after stream exhaustion."""
     if sink is None:
         return
     sink.clear()
