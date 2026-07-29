@@ -1594,7 +1594,7 @@ class FasterQwen3TTS:
         all_codes = []
         codec_hasher = hashlib.sha256() if self.collect_generation_trace else None
         codec_frame_count = 0
-        last_timing: Optional[dict] = None
+        termination_trace: dict = {}
         prev_audio_len = 0
         samples_per_frame = None
 
@@ -1616,6 +1616,7 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
             input_metadata=input_metadata,
+            termination_sink=termination_trace,
             profile_prefill=profile_prefill,
             profile_nvtx=profile_nvtx,
             prefill_backend=prefill_backend,
@@ -1738,19 +1739,20 @@ class FasterQwen3TTS:
                         speech_tokenizer_decode_gpu_ms
                     )
 
-            last_timing = timing
             yield new_audio, sr, timing
 
         if codec_hasher is not None:
-            timing = last_timing or {}
             self.last_generation_trace = {
                 "codec_sha256": codec_hasher.hexdigest(),
                 "codec_frame_count": codec_frame_count,
-                "termination_reason": timing.get("termination_reason"),
-                "terminal_token_id": timing.get("terminal_token_id"),
-                "terminal_step_index": timing.get("terminal_step_index"),
-                "generated_steps": timing.get("generated_steps"),
-                "emitted_steps": timing.get("emitted_steps"),
+                "termination_reason": termination_trace.get("termination_reason"),
+                "terminal_token_id": termination_trace.get("terminal_token_id"),
+                "terminal_step_index": termination_trace.get("terminal_step_index"),
+                "generated_steps": termination_trace.get("generated_steps"),
+                "emitted_steps": termination_trace.get("emitted_steps"),
+                "hit_eos": termination_trace.get("hit_eos"),
+                "hit_max_new_tokens": termination_trace.get("hit_max_new_tokens"),
+                "hit_max_seq_len": termination_trace.get("hit_max_seq_len"),
             }
 
     @torch.inference_mode()

@@ -684,6 +684,7 @@ def fast_generate_streaming(
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
     input_metadata: Optional[dict] = None,
+    termination_sink: Optional[dict] = None,
     profile_prefill: bool = False,
     profile_nvtx: bool = False,
     prefill_backend: str = "eager",
@@ -1101,6 +1102,13 @@ def fast_generate_streaming(
             ),
         )
 
+    _publish_termination_sink(
+        termination_sink,
+        termination,
+        generated_steps=total_steps,
+        emitted_steps=total_steps,
+    )
+
 
 def _profile_outer_nvtx_name(input_metadata: Optional[dict]) -> Optional[str]:
     if not input_metadata:
@@ -1400,6 +1408,27 @@ def _termination_telemetry(
     telemetry["generated_steps"] = generated_steps
     telemetry["emitted_steps"] = emitted_steps
     return telemetry
+
+
+def _publish_termination_sink(
+    sink: Optional[dict],
+    termination: dict,
+    *,
+    generated_steps: int,
+    emitted_steps: int,
+) -> None:
+    """Expose terminal accounting even when no final audio chunk is yielded."""
+    if sink is None:
+        return
+    sink.clear()
+    sink.update(
+        _termination_telemetry(
+            termination,
+            generated_steps=generated_steps,
+            emitted_steps=emitted_steps,
+            include=True,
+        )
+    )
 
 
 @torch.inference_mode()

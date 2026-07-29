@@ -46,6 +46,31 @@ def test_sample_logits_greedy_does_not_call_multinomial(monkeypatch):
     assert token.tolist() == [1]
 
 
+def test_terminal_sink_is_complete_without_final_audio_chunk():
+    sink = {"stale": True}
+    termination = {
+        "termination_reason": "eos",
+        "hit_eos": True,
+        "hit_max_new_tokens": False,
+        "hit_max_seq_len": False,
+        "terminal_token_id": 9,
+        "terminal_step_index": 14,
+    }
+
+    streaming._publish_termination_sink(
+        sink,
+        termination,
+        generated_steps=14,
+        emitted_steps=13,
+    )
+
+    assert sink == {
+        **termination,
+        "generated_steps": 14,
+        "emitted_steps": 13,
+    }
+
+
 def test_faster_wrapper_selects_greedy_predictor_graph():
     sampling_graph = types.SimpleNamespace(do_sample=True)
     greedy_graph = types.SimpleNamespace(do_sample=False)
