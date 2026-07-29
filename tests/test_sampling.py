@@ -90,10 +90,47 @@ def test_empty_chunk_schedule_preserves_fixed_chunk_size():
     assert streaming._chunk_target_steps(8, schedule, 4) == 8
 
 
+def test_chunk_schedule_normalizes_a_generator_once():
+    schedule = streaming._normalize_chunk_schedule(value for value in (6, 8, 12))
+
+    assert schedule == (6, 8, 12)
+    assert [streaming._chunk_target_steps(8, schedule, index) for index in range(4)] == [
+        6,
+        8,
+        12,
+        12,
+    ]
+
+
 @pytest.mark.parametrize("schedule", ([0], [-1], [6, 0, 12]))
 def test_chunk_schedule_rejects_non_positive_sizes(schedule):
     with pytest.raises(ValueError, match="chunk_schedule values must be positive"):
         streaming._normalize_chunk_schedule(schedule)
+
+
+def test_chunk_schedule_rejects_an_excessive_target():
+    with pytest.raises(ValueError, match="must not exceed"):
+        streaming._normalize_chunk_schedule([65])
+
+
+@pytest.mark.parametrize("chunk_steps", range(1, 6))
+def test_final_chunk_may_be_shorter_than_first_target(chunk_steps):
+    streaming._validate_chunk_steps(chunk_steps, 6, is_final=True)
+
+
+@pytest.mark.parametrize("chunk_steps", range(1, 8))
+def test_final_chunk_may_be_shorter_than_second_target(chunk_steps):
+    streaming._validate_chunk_steps(chunk_steps, 8, is_final=True)
+
+
+@pytest.mark.parametrize("chunk_steps", range(1, 12))
+def test_final_chunk_may_be_shorter_than_steady_target(chunk_steps):
+    streaming._validate_chunk_steps(chunk_steps, 12, is_final=True)
+
+
+def test_non_terminal_chunk_must_match_its_target():
+    with pytest.raises(RuntimeError, match="non-terminal"):
+        streaming._validate_chunk_steps(5, 6, is_final=False)
 
 
 def test_faster_wrapper_selects_greedy_predictor_graph():

@@ -36,6 +36,11 @@ _PREFILL_BACKENDS = {
     "compile_inductor_graphbreak",
     "compile_reduce_overhead",
 }
+
+# Scheduled chunks are a latency feature, not a bulk-output control. Keeping
+# their target bounded prevents an accidental configuration from hiding output
+# for multiple seconds before the next PCM callback.
+MAX_CHUNK_SCHEDULE_STEPS = 64
 _PREFILL_BACKEND_ALIASES = {
     "compile_default": "compile_inductor_default",
 }
@@ -127,13 +132,26 @@ def _normalize_prefill_compile_lengths(
 def _normalize_chunk_schedule(
     chunk_schedule: Optional[Iterable[int]],
 ) -> tuple[int, ...]:
-    """Return a validated finite prefix of per-chunk emission sizes."""
+    """Return an authoritative first/second/steady emission schedule.
+
+    The final item is reused as the steady-state target. An empty schedule
+    preserves the legacy fixed ``chunk_size`` path.
+    """
 
     if chunk_schedule is None:
         return ()
-    normalized = tuple(int(value) for value in chunk_schedule)
+    normalized = (
+        chunk_schedule
+        if isinstance(chunk_schedule, tuple)
+        else tuple(int(value) for value in chunk_schedule)
+    )
     if any(value <= 0 for value in normalized):
         raise ValueError("chunk_schedule values must be positive")
+    if any(value > MAX_CHUNK_SCHEDULE_STEPS for value in normalized):
+        raise ValueError(
+            "chunk_schedule values must not exceed "
+            f"{MAX_CHUNK_SCHEDULE_STEPS}"
+        )
     return normalized
 
 
@@ -149,6 +167,24 @@ def _chunk_target_steps(
     if not chunk_schedule:
         return chunk_size
     return chunk_schedule[min(chunk_index, len(chunk_schedule) - 1)]
+
+
+def _validate_chunk_steps(
+    chunk_steps: int,
+    chunk_target_steps: int,
+    *,
+    is_final: bool,
+) -> None:
+    """Assert the streaming contract for a complete or terminal PCM chunk."""
+
+    if chunk_steps <= 0:
+        raise RuntimeError("streaming chunk must contain at least one frame")
+    if chunk_target_steps <= 0:
+        raise RuntimeError("streaming chunk target must be positive")
+    if chunk_steps > chunk_target_steps:
+        raise RuntimeError("streaming chunk exceeds its scheduled target")
+    if not is_final and chunk_steps != chunk_target_steps:
+        raise RuntimeError("non-terminal streaming chunk is shorter than its target")
 
 
 def _run_talker_prefill(
@@ -1134,6 +1170,12 @@ def fast_generate_streaming(
             if chunk_count == 0:
                 prefill_profile.update(decode_phase_timer.metrics())
 
+            _validate_chunk_steps(
+                len(chunk_buffer),
+                chunk_target_steps,
+                is_final=is_final_chunk,
+            )
+
             yield (
                 torch.stack(chunk_buffer),
                 _chunk_timing(
@@ -1202,17 +1244,24 @@ def fast_generate_streaming(
         if chunk_count == 0:
             prefill_profile.update(decode_phase_timer.metrics())
 
+        chunk_target_steps = _chunk_target_steps(
+            chunk_size,
+            normalized_chunk_schedule,
+            chunk_count,
+        )
+        _validate_chunk_steps(
+            len(chunk_buffer),
+            chunk_target_steps,
+            is_final=True,
+        )
+
         yield (
             torch.stack(chunk_buffer),
             _chunk_timing(
                 {
                     "chunk_index": chunk_count,
                     "chunk_steps": len(chunk_buffer),
-                    "chunk_target_steps": _chunk_target_steps(
-                        chunk_size,
-                        normalized_chunk_schedule,
-                        chunk_count,
-                    ),
+                    "chunk_target_steps": chunk_target_steps,
                     "chunk_schedule_index": min(
                         chunk_count,
                         len(normalized_chunk_schedule) - 1,

@@ -1573,7 +1573,9 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_size in "0b6":
             instruct = None
 
-        from .streaming import fast_generate_streaming
+        from .streaming import _normalize_chunk_schedule, fast_generate_streaming
+
+        normalized_chunk_schedule = _normalize_chunk_schedule(chunk_schedule)
 
         m, talker, config, tie, tam, tth, tpe, input_metadata = (
             self._prepare_generation_custom(
@@ -1593,7 +1595,7 @@ class FasterQwen3TTS:
         context_frames = 25
         min_calibration_frames = max(
             context_frames,
-            *(chunk_schedule or (chunk_size,)),
+            *(normalized_chunk_schedule or (chunk_size,)),
         )
         all_codes = []
         codec_hasher = hashlib.sha256() if self.collect_generation_trace else None
@@ -1619,7 +1621,7 @@ class FasterQwen3TTS:
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
-            chunk_schedule=chunk_schedule,
+            chunk_schedule=normalized_chunk_schedule,
             input_metadata=input_metadata,
             termination_sink=termination_trace,
             profile_prefill=profile_prefill,
@@ -1877,7 +1879,9 @@ class FasterQwen3TTS:
             default=True,
         )
 
-        from .streaming import fast_generate_streaming
+        from .streaming import _normalize_chunk_schedule, fast_generate_streaming
+
+        normalized_chunk_schedule = _normalize_chunk_schedule(chunk_schedule)
 
         m, talker, config, tie, tam, tth, tpe, input_metadata = (
             self._prepare_generation_custom(
@@ -1897,7 +1901,7 @@ class FasterQwen3TTS:
         context_frames = 25
         min_calibration_frames = max(
             context_frames,
-            *(chunk_schedule or (chunk_size,)),
+            *(normalized_chunk_schedule or (chunk_size,)),
         )
         all_codes = []
         prev_audio_len = 0
@@ -1920,7 +1924,7 @@ class FasterQwen3TTS:
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
-            chunk_schedule=chunk_schedule,
+            chunk_schedule=normalized_chunk_schedule,
             input_metadata=input_metadata,
             profile_prefill=profile_prefill,
             profile_nvtx=profile_nvtx,
