@@ -1593,16 +1593,11 @@ class FasterQwen3TTS:
         speech_tokenizer = m.speech_tokenizer
 
         context_frames = 25
-        min_calibration_frames = max(
-            context_frames,
-            *(normalized_chunk_schedule or (chunk_size,)),
-        )
+        samples_per_frame = int(speech_tokenizer.get_decode_upsample_rate())
         all_codes = []
         codec_hasher = hashlib.sha256() if self.collect_generation_trace else None
         codec_frame_count = 0
         termination_trace: dict = {}
-        prev_audio_len = 0
-        samples_per_frame = None
 
         for codec_chunk, timing in fast_generate_streaming(
             talker=talker,
@@ -1650,7 +1645,7 @@ class FasterQwen3TTS:
             all_flat = torch.cat(all_codes, dim=0)
             n_total = all_flat.shape[0]
 
-            if samples_per_frame is None:
+            if n_total <= context_frames:
                 decode_input = all_flat
             else:
                 ctx_start = max(0, n_total - n_new - context_frames)
@@ -1699,20 +1694,8 @@ class FasterQwen3TTS:
                 )
 
             audio_slice_started = time.perf_counter()
-            if samples_per_frame is None:
-                new_audio = audio[prev_audio_len:]
-                prev_audio_len = len(audio)
-
-                if n_total >= min_calibration_frames:
-                    samples_per_frame = len(audio) / n_total
-            else:
-                n_ctx = decode_input.shape[0] - n_new
-
-                if n_ctx > 0:
-                    ctx_samples = int(round(n_ctx * samples_per_frame))
-                    new_audio = audio[ctx_samples:]
-                else:
-                    new_audio = audio
+            step_samples = int(n_new) * samples_per_frame
+            new_audio = audio[-step_samples:] if step_samples > 0 else audio
 
             audio_slice_ms = (time.perf_counter() - audio_slice_started) * 1000
             codec_wrapper_wall_ms = (time.perf_counter() - wrapper_started) * 1000
