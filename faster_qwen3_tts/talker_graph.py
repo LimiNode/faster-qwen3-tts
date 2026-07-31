@@ -161,15 +161,21 @@ class TalkerGraph:
         """Reset cache for new sequence."""
         self.static_cache.reset()
 
-    def prefill_kv(self, past_key_values):
+    def prefill_kv(self, past_key_values, *, source_start: int = 0):
         """
         Copy HF DynamicCache from prefill into our StaticCache.
         past_key_values: DynamicCache with num_layers layers of [1, kv_heads, seq_len, head_dim]
         """
+        if source_start < 0:
+            raise ValueError("source_start must be non-negative")
         self.static_cache.reset()
         seq_len = 0
         for li in range(self.num_layers):
             k, v = past_key_values[li]  # each [1, kv_heads, seq_len, head_dim]
+            if source_start >= k.shape[2]:
+                raise ValueError("source_start must leave at least one KV position")
+            k = k[:, :, source_start:, :]
+            v = v[:, :, source_start:, :]
             seq_len = k.shape[2]
             if seq_len > self.max_seq_len:
                 raise RuntimeError(

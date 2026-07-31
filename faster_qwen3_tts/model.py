@@ -20,7 +20,11 @@ from .prefill_compat import (
     normalize_prefill_compile_compat_mode,
     prefill_compile_compat_metadata,
 )
-from .streaming import _normalize_prefill_backend, clear_prefill_compile_cache
+from .streaming import (
+    _normalize_prefill_backend,
+    clear_prefill_compile_cache,
+    pad_prefill_inputs_left,
+)
 from .utils import suppress_flash_attn_warning
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,7 @@ class FasterQwen3TTS:
         prefill_compile_on_miss: bool = True,
         prefill_unknown_shape_policy: str = "eager",
         prefill_require_precompiled: bool = False,
+        prefill_pad_to_length: int | None = None,
     ):
         self.model = base_model  # The qwen-tts Qwen3TTSModel instance
         self.predictor_graph = predictor_graph
@@ -77,6 +82,9 @@ class FasterQwen3TTS:
         if self.prefill_unknown_shape_policy not in {"eager", "error"}:
             raise ValueError("prefill_unknown_shape_policy must be eager or error")
         self.prefill_require_precompiled = bool(prefill_require_precompiled)
+        if prefill_pad_to_length is not None and prefill_pad_to_length <= 0:
+            raise ValueError("prefill_pad_to_length must be positive when provided")
+        self.prefill_pad_to_length = prefill_pad_to_length
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
         self._voice_prompt_cache = {}  # Cache (ref_audio, ref_text) -> (vcp, ref_ids)
@@ -229,6 +237,7 @@ class FasterQwen3TTS:
         prefill_compile_on_miss: bool = True,
         prefill_unknown_shape_policy: str = "eager",
         prefill_require_precompiled: bool = False,
+        prefill_pad_to_length: int | None = None,
     ):
         """
         Load Qwen3-TTS model and prepare CUDA graphs.
@@ -249,6 +258,7 @@ class FasterQwen3TTS:
             qwentts_clamp_fp16: Whether qwentts.cpp should clamp fp16 operations.
             qwentts_ref_cache_dir: Optional cache directory for GGML voice-clone
                 `.spk` / `.rvq` references extracted from raw reference audio.
+            prefill_pad_to_length: Research-only eager left-padding ceiling.
 
         Returns:
             A backend-specific model implementing the public generation and
@@ -381,6 +391,7 @@ class FasterQwen3TTS:
             prefill_compile_on_miss=prefill_compile_on_miss,
             prefill_unknown_shape_policy=prefill_unknown_shape_policy,
             prefill_require_precompiled=prefill_require_precompiled,
+            prefill_pad_to_length=prefill_pad_to_length,
         )
 
     def warmup(self, prefill_len: int = 100) -> None:
@@ -813,6 +824,18 @@ class FasterQwen3TTS:
                 "tokenize_wall_ms": tokenize_wall_ms,
                 "build_talker_inputs_wall_ms": build_talker_inputs_wall_ms,
             }
+            tie, tam, padding_metadata = pad_prefill_inputs_left(
+                tie,
+                tam,
+                target_length=self.prefill_pad_to_length,
+            )
+            if padding_metadata["prefill_padding_enabled"]:
+                metadata.update(padding_metadata)
+                metadata["talker_prefill_length"] = int(tie.shape[1])
+                metadata["prefill_attention_mask_all_valid"] = False
+                metadata["prefill_mask_decision_source"] = (
+                    "research_left_pad_to_exact"
+                )
             return m, talker, config, tie, tam, tth, tpe, metadata
 
         return m, talker, config, tie, tam, tth, tpe

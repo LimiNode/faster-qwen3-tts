@@ -233,6 +233,11 @@ def _run_talker_prefill(
         prefill_unknown_shape_policy
     )
     _validate_prefill_configuration(prefill_backend, prefill_mask_mode)
+    _validate_padded_prefill_configuration(
+        prefill_backend=prefill_backend,
+        prefill_mask_mode=prefill_mask_mode,
+        input_metadata=input_metadata,
+    )
     skip_prefill_causal_mask = prefill_mask_mode == "skip"
     prefill_attention_mask = None if skip_prefill_causal_mask else attention_mask
     _validate_prefill_compile_compat_configuration(
@@ -311,6 +316,25 @@ def _run_talker_prefill(
         "prefill_compiled_call_2_host_ms": 0.0,
         "prefill_compiled_call_3plus_host_ms": 0.0,
         "prefill_shape_call_ordinal": 0,
+        "prefill_padding_enabled": bool(
+            isinstance(input_metadata, dict)
+            and input_metadata.get("prefill_padding_enabled")
+        ),
+        "prefill_padding_target_length": (
+            input_metadata.get("prefill_padding_target_length")
+            if isinstance(input_metadata, dict)
+            else None
+        ),
+        "prefill_padding_left_tokens": (
+            input_metadata.get("prefill_padding_left_tokens")
+            if isinstance(input_metadata, dict)
+            else 0
+        ),
+        "prefill_real_length": (
+            input_metadata.get("prefill_real_length")
+            if isinstance(input_metadata, dict)
+            else shape_length
+        ),
         **memory_before,
     }
     if prefill_backend == "eager":
@@ -690,6 +714,86 @@ def _validate_prefill_configuration(
         )
 
 
+def pad_prefill_inputs_left(
+    talker_input_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    target_length: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | bool]]:
+    """Left-pad one prefill request for an eager-only fixed-shape experiment.
+
+    The caller must trim the matching leading KV entries before decode.  This
+    helper deliberately does not make padding a transparent optimization: its
+    metadata is consumed by ``fast_generate_streaming`` to enforce that rule.
+    """
+
+    actual_length = int(talker_input_embeds.shape[1])
+    metadata: dict[str, int | bool] = {
+        "prefill_padding_enabled": False,
+        "prefill_padding_target_length": actual_length,
+        "prefill_padding_left_tokens": 0,
+        "prefill_real_length": actual_length,
+    }
+    if target_length is None:
+        return talker_input_embeds, attention_mask, metadata
+    if target_length <= 0:
+        raise ValueError("prefill padding target_length must be positive")
+    if talker_input_embeds.ndim != 3 or attention_mask.ndim != 2:
+        raise ValueError("prefill padding expects [batch, sequence, hidden] inputs")
+    if talker_input_embeds.shape[:2] != attention_mask.shape:
+        raise ValueError("prefill padding inputs and attention mask must agree")
+    if talker_input_embeds.shape[0] != 1:
+        raise ValueError("prefill padding experiment only supports batch_size=1")
+    if actual_length > target_length:
+        raise ValueError(
+            "prefill padding target is shorter than the real prefill: "
+            f"target={target_length}, actual={actual_length}"
+        )
+    if actual_length == target_length:
+        return talker_input_embeds, attention_mask, metadata
+
+    left_tokens = target_length - actual_length
+    padded_embeds = F.pad(talker_input_embeds, (0, 0, left_tokens, 0))
+    padded_mask = F.pad(attention_mask, (left_tokens, 0), value=0)
+    metadata.update(
+        {
+            "prefill_padding_enabled": True,
+            "prefill_padding_target_length": target_length,
+            "prefill_padding_left_tokens": left_tokens,
+            "prefill_real_length": actual_length,
+        }
+    )
+    return padded_embeds, padded_mask, metadata
+
+
+def _validate_padded_prefill_configuration(
+    *,
+    prefill_backend: str,
+    prefill_mask_mode: str,
+    input_metadata: Optional[dict],
+) -> None:
+    """Keep the experimental padded route intentionally eager and explicit."""
+
+    if not isinstance(input_metadata, dict) or not input_metadata.get(
+        "prefill_padding_enabled"
+    ):
+        return
+    if prefill_backend != "eager":
+        raise UnsupportedPrefillConfiguration(
+            "padded prefill research only permits prefill_backend=eager"
+        )
+    if prefill_mask_mode != "explicit":
+        raise UnsupportedPrefillConfiguration(
+            "padded prefill research requires an explicit attention mask"
+        )
+    real_length = input_metadata.get("prefill_real_length")
+    left_tokens = input_metadata.get("prefill_padding_left_tokens")
+    if not isinstance(real_length, int) or real_length <= 0:
+        raise UnsupportedPrefillConfiguration("padded prefill missing real length")
+    if not isinstance(left_tokens, int) or left_tokens <= 0:
+        raise UnsupportedPrefillConfiguration("padded prefill missing left padding")
+
+
 def _validate_prefill_compile_compat_configuration(
     *,
     prefill_backend: str,
@@ -970,7 +1074,19 @@ def fast_generate_streaming(
 
     prefill_kv_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_static_cache", nvtx_enabled):
-        prefill_len = talker_graph.prefill_kv(talker_past_kv)
+        padded_prefill = bool(
+            isinstance(input_metadata, dict)
+            and input_metadata.get("prefill_padding_enabled")
+        )
+        left_pad_tokens = (
+            int(input_metadata.get("prefill_padding_left_tokens", 0))
+            if isinstance(input_metadata, dict)
+            else 0
+        )
+        prefill_len = talker_graph.prefill_kv(
+            talker_past_kv,
+            source_start=left_pad_tokens if padded_prefill else 0,
+        )
     prefill_profile["prefill_kv_launch_wall_ms"] = (
         time.perf_counter() - prefill_kv_started
     ) * 1000
@@ -979,7 +1095,7 @@ def fast_generate_streaming(
     generation_state_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_generation_state", nvtx_enabled):
         rope_deltas = getattr(talker, "rope_deltas", None)
-        attention_mask_all_valid = (
+        attention_mask_all_valid = padded_prefill or (
             isinstance(input_metadata, dict)
             and input_metadata.get("prefill_attention_mask_all_valid") is True
         )
