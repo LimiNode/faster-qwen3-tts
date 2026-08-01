@@ -674,6 +674,30 @@ def test_fast_generate_streaming_auto_verified_metadata_resolves_skip(monkeypatc
         next(generator)
 
 
+def test_fast_generate_streaming_stops_before_prefill_when_cancelled():
+    talker = _dummy_streaming_model()
+    tie, tam, tth, tpe = _dummy_prefill_inputs()
+    termination = {}
+    generator = streaming.fast_generate_streaming(
+        talker=talker,
+        talker_input_embeds=tie,
+        attention_mask=tam,
+        trailing_text_hiddens=tth,
+        tts_pad_embed=tpe,
+        config=talker.config,
+        predictor_graph=types.SimpleNamespace(),
+        talker_graph=types.SimpleNamespace(),
+        input_metadata=_verified_prefill_metadata(),
+        prefill_backend="eager",
+        cancel_check=lambda: True,
+        termination_sink=termination,
+    )
+
+    with pytest.raises(StopIteration):
+        next(generator)
+    assert termination == {"termination_reason": "cancelled"}
+
+
 def test_fast_generate_streaming_forwards_prefill_compile_compat_mode(monkeypatch):
     class ReachedPrefill(RuntimeError):
         pass

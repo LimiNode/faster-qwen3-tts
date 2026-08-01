@@ -9,7 +9,7 @@ import hashlib
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -1557,6 +1557,7 @@ class FasterQwen3TTS:
         profile_request_role: Optional[str] = None,
         prefill_backend: Optional[str] = None,
         prefill_compile_compat_mode: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "custom_voice":
             raise ValueError("Loaded model does not support custom voice generation")
@@ -1633,6 +1634,7 @@ class FasterQwen3TTS:
             prefill_compile_on_miss=self.prefill_compile_on_miss,
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
             prefill_require_precompiled=self.prefill_require_precompiled,
+            cancel_check=cancel_check,
         ):
             wrapper_started = time.perf_counter()
             context_started = time.perf_counter()
@@ -1864,6 +1866,7 @@ class FasterQwen3TTS:
         profile_request_role: Optional[str] = None,
         prefill_backend: Optional[str] = None,
         prefill_compile_compat_mode: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         if self.model.model.tts_model_type != "voice_design":
             raise ValueError("Loaded model does not support voice design generation")
@@ -1934,6 +1937,7 @@ class FasterQwen3TTS:
             prefill_compile_on_miss=self.prefill_compile_on_miss,
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
             prefill_require_precompiled=self.prefill_require_precompiled,
+            cancel_check=cancel_check,
         ):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]

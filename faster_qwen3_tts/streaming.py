@@ -860,6 +860,7 @@ def fast_generate_streaming(
     prefill_compile_on_miss: bool = True,
     prefill_unknown_shape_policy: str = "eager",
     prefill_require_precompiled: bool = False,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -896,6 +897,10 @@ def fast_generate_streaming(
     else:
         prefill_mask_mode = _normalize_prefill_mask_mode(prefill_mask_mode)
     _validate_prefill_configuration(prefill_backend, prefill_mask_mode)
+    if cancel_check is not None and cancel_check():
+        if termination_sink is not None:
+            termination_sink["termination_reason"] = "cancelled"
+        return
 
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.perf_counter()
@@ -1051,6 +1056,14 @@ def fast_generate_streaming(
     chunk_start = time.time()
 
     for step_idx in range(max_new_tokens):
+        if cancel_check is not None and cancel_check():
+            termination.update(
+                {
+                    "termination_reason": "cancelled",
+                    "terminal_step_index": step_idx - 1 if step_idx else None,
+                }
+            )
+            break
         termination["generator_loop_iterations"] = step_idx + 1
         if step_idx > 0:
             prev_slot = (step_idx - 1) % 2
