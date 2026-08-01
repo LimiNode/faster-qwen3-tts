@@ -96,6 +96,15 @@ class FasterQwen3TTS:
             raise AttributeError("Underlying model does not expose a speech_tokenizer")
         return speech_tokenizer
 
+    @property
+    def supports_custom_voice_instructions(self) -> bool:
+        """Whether CustomVoice ``instruct`` prompts reach model preparation.
+
+        The public API accepts the optional argument for every CustomVoice size.
+        This experimental branch keeps it intact for the 0.6B model as well.
+        """
+        return True
+
     @staticmethod
     def _infer_sample_rate(base_model) -> int:
         """Infer output audio sample rate from qwen-tts internals."""
@@ -1473,9 +1482,6 @@ class FasterQwen3TTS:
             default=True,
         )
 
-        if self.model.model.tts_model_size in "0b6":
-            instruct = None
-
         from .generate import fast_generate
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
@@ -1573,9 +1579,6 @@ class FasterQwen3TTS:
             non_streaming_mode,
             default=True,
         )
-
-        if self.model.model.tts_model_size in "0b6":
-            instruct = None
 
         from .streaming import _normalize_chunk_schedule, fast_generate_streaming
 

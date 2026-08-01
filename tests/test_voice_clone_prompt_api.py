@@ -146,6 +146,45 @@ def test_public_api_uses_none_sentinel_for_non_streaming_overrides():
 
 
 @pytest.mark.parametrize(
+    ("method_name", "kwargs"),
+    [
+        (
+            "generate_custom_voice",
+            {"text": "hello", "speaker": "speaker_a", "language": "English"},
+        ),
+        (
+            "generate_custom_voice_streaming",
+            {"text": "hello", "speaker": "speaker_a", "language": "English"},
+        ),
+    ],
+)
+def test_custom_voice_0b6_preserves_instruction_for_prompt_preparation(
+    monkeypatch, method_name, kwargs
+):
+    model = _build_dummy_model()
+    model.model.model.tts_model_type = "custom_voice"
+    model.model.model.tts_model_size = "0b6"
+    captured = {}
+
+    def _capture(*_args, **inner_kwargs):
+        captured["instruct"] = inner_kwargs["instruct"]
+        raise RuntimeError("stop after capture")
+
+    monkeypatch.setattr(model, "_prepare_generation_custom", _capture)
+
+    with pytest.raises(RuntimeError, match="stop after capture"):
+        result = getattr(model, method_name)(
+            instruct="Speak with controlled urgency.",
+            **kwargs,
+        )
+        if method_name.endswith("_streaming"):
+            next(result)
+
+    assert model.supports_custom_voice_instructions is True
+    assert captured["instruct"] == "Speak with controlled urgency."
+
+
+@pytest.mark.parametrize(
     ("method_name", "kwargs", "expected_default"),
     [
         ("generate_voice_clone", {"text": "hello", "language": "English"}, False),
