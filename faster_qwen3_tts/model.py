@@ -37,7 +37,7 @@ def _diagnostic_tensor_sha256(value: Any) -> str | None:
     digest = hashlib.sha256()
     digest.update(str(normalized.dtype).encode("ascii"))
     digest.update(repr(tuple(normalized.shape)).encode("ascii"))
-    digest.update(normalized.numpy().tobytes())
+    digest.update(normalized.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
