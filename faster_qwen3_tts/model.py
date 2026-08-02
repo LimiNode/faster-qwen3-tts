@@ -26,6 +26,112 @@ from .utils import suppress_flash_attn_warning
 logger = logging.getLogger(__name__)
 
 
+def _diagnostic_tensor_sha256(value: Any) -> str | None:
+    """Return a stable content digest for one tensor-like diagnostic value."""
+
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return None
+    normalized = value.detach().to(device="cpu").contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(normalized.dtype).encode("ascii"))
+    digest.update(repr(tuple(normalized.shape)).encode("ascii"))
+    digest.update(normalized.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _voice_clone_prompt_sha256(prompt: Any) -> str:
+    """Fingerprint prompt inputs without exposing tensor payloads in telemetry."""
+
+    digest = hashlib.sha256()
+
+    def update(value: Any) -> None:
+        if value is None:
+            digest.update(b"none")
+            return
+        if isinstance(value, torch.Tensor):
+            digest.update(b"tensor:")
+            digest.update((_diagnostic_tensor_sha256(value) or "").encode("ascii"))
+            return
+        if isinstance(value, str):
+            digest.update(b"str:")
+            digest.update(value.encode("utf-8"))
+            return
+        if isinstance(value, bytes):
+            digest.update(b"bytes:")
+            digest.update(value)
+            return
+        if isinstance(value, (bool, int, float)):
+            digest.update(f"scalar:{value!r}".encode("ascii"))
+            return
+        if isinstance(value, dict):
+            digest.update(b"dict:")
+            for key in sorted(value, key=str):
+                update(str(key))
+                update(value[key])
+            return
+        if isinstance(value, (list, tuple)):
+            digest.update(f"sequence:{len(value)}:".encode("ascii"))
+            for item in value:
+                update(item)
+            return
+
+        digest.update(f"object:{type(value).__qualname__}:".encode("ascii"))
+        for attribute in (
+            "ref_spk_embedding",
+            "ref_code",
+            "ref_text",
+            "x_vector_only_mode",
+            "icl_mode",
+        ):
+            if hasattr(value, attribute):
+                update(attribute)
+                update(getattr(value, attribute))
+
+    update(prompt)
+    return digest.hexdigest()
+
+
+def _static_cache_sequence_length(cache: Any) -> int | None:
+    """Read a cache's logical sequence length when its runtime exposes one."""
+
+    get_length = getattr(cache, "get_seq_length", None)
+    if not callable(get_length):
+        return None
+    value = get_length()
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    return int(value)
+
+
+def _reset_diagnostic_state(model: "FasterQwen3TTS") -> Dict[str, Any]:
+    """Capture reset postconditions without mutating graph or cache state."""
+
+    talker_graph = model.talker_graph
+    predictor_graphs = (
+        graph
+        for graph in (model.predictor_graph, model.predictor_graph_greedy)
+        if graph is not None
+    )
+    return {
+        "talker_static_cache_sequence_length": _static_cache_sequence_length(
+            getattr(talker_graph, "static_cache", None)
+        ),
+        "predictor_static_cache_sequence_lengths": [
+            _static_cache_sequence_length(getattr(graph, "static_cache", None))
+            for graph in predictor_graphs
+        ],
+        "talker_cache_position": _diagnostic_tensor_sha256(
+            getattr(talker_graph, "cache_position", None)
+        ),
+        "talker_rope_deltas": _diagnostic_tensor_sha256(
+            getattr(talker_graph, "rope_deltas", None)
+        ),
+        "talker_mask_key": repr(getattr(talker_graph, "_mask_key", None)),
+    }
+
+
 class FasterQwen3TTS:
     """
     Qwen3-TTS model with CUDA graphs for real-time inference.
@@ -437,7 +543,7 @@ class FasterQwen3TTS:
                 predictor_reset_count += 1
 
             talker_reset(0)
-        return {
+        metadata = {
             "reset_api_version": 1,
             "talker_graph_reset": True,
             "predictor_graphs_reset": predictor_reset_count,
@@ -445,6 +551,9 @@ class FasterQwen3TTS:
             "cuda_graphs_preserved": True,
             "generation_mask_cache_preserved": True,
         }
+        if getattr(self, "collect_generation_trace", False):
+            metadata["diagnostic_reset_state"] = _reset_diagnostic_state(self)
+        return metadata
 
     def generate(
         self,
@@ -1337,6 +1446,14 @@ class FasterQwen3TTS:
             default=False,
         )
 
+        diagnostics_enabled = bool(self.collect_generation_trace)
+        if diagnostics_enabled:
+            self.last_generation_trace = None
+        prompt_before_sha256 = (
+            _voice_clone_prompt_sha256(voice_clone_prompt)
+            if diagnostics_enabled
+            else None
+        )
         m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
             text=text,
             language=language,
@@ -1360,6 +1477,9 @@ class FasterQwen3TTS:
         all_codes = []
         prev_gen_audio_len = 0  # tracks position within the generated (non-ref) audio
         samples_per_frame = None
+        codec_hasher = hashlib.sha256() if diagnostics_enabled else None
+        codec_frame_count = 0
+        codec_prefix: list[list[int]] = []
 
         stream_fn = (
             parity_generate_streaming if parity_mode else fast_generate_streaming
@@ -1387,6 +1507,17 @@ class FasterQwen3TTS:
         for codec_chunk, timing in stream_fn(**stream_kwargs):
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
+            if codec_hasher is not None:
+                normalized_codes = (
+                    codec_chunk.detach()
+                    .to(device="cpu", dtype=torch.int32)
+                    .contiguous()
+                )
+                codec_hasher.update(normalized_codes.numpy().tobytes())
+                codec_frame_count += int(n_new)
+                remaining_prefix = max(0, 32 - len(codec_prefix))
+                if remaining_prefix:
+                    codec_prefix.extend(normalized_codes[:remaining_prefix].tolist())
             all_flat = torch.cat(all_codes, dim=0)
             n_total = all_flat.shape[0]
 
@@ -1445,6 +1576,27 @@ class FasterQwen3TTS:
                     new_audio = audio
 
             yield new_audio, sr, timing
+
+        if diagnostics_enabled:
+            self.last_generation_trace = {
+                "trace_kind": "voice_clone_streaming_v1",
+                "voice_clone_prompt_source": (
+                    "precomputed" if voice_clone_prompt is not None else "reference"
+                ),
+                "voice_clone_prompt_sha256_before": prompt_before_sha256,
+                "voice_clone_prompt_sha256_after": _voice_clone_prompt_sha256(
+                    voice_clone_prompt
+                ),
+                "reference_codec_sha256": _diagnostic_tensor_sha256(ref_codes),
+                "reference_codec_shape": (
+                    list(ref_codes.shape) if ref_codes is not None else None
+                ),
+                "generated_codec_sha256": (
+                    codec_hasher.hexdigest() if codec_hasher is not None else None
+                ),
+                "generated_codec_frame_count": codec_frame_count,
+                "generated_codec_prefix": codec_prefix,
+            }
 
     @torch.inference_mode()
     def generate_custom_voice(
