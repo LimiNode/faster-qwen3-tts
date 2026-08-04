@@ -1480,6 +1480,7 @@ class FasterQwen3TTS:
         codec_hasher = hashlib.sha256() if diagnostics_enabled else None
         codec_frame_count = 0
         codec_prefix: list[list[int]] = []
+        termination_trace: dict[str, Any] = {}
 
         stream_fn = (
             parity_generate_streaming if parity_mode else fast_generate_streaming
@@ -1503,6 +1504,7 @@ class FasterQwen3TTS:
         if not parity_mode:
             stream_kwargs["predictor_graph"] = self._select_predictor_graph(do_sample)
             stream_kwargs["talker_graph"] = self.talker_graph
+            stream_kwargs["termination_sink"] = termination_trace
 
         for codec_chunk, timing in stream_fn(**stream_kwargs):
             all_codes.append(codec_chunk)
