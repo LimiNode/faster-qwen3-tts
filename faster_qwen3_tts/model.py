@@ -1596,6 +1596,17 @@ class FasterQwen3TTS:
                 ),
                 "generated_codec_frame_count": codec_frame_count,
                 "generated_codec_prefix": codec_prefix,
+                "termination_reason": termination_trace.get("termination_reason"),
+                "terminal_step_index": termination_trace.get(
+                    "terminal_step_index"
+                ),
+                "generated_steps": termination_trace.get("generated_steps"),
+                "emitted_steps": termination_trace.get("emitted_steps"),
+                "hit_eos": termination_trace.get("hit_eos"),
+                "hit_max_new_tokens": termination_trace.get(
+                    "hit_max_new_tokens"
+                ),
+                "hit_max_seq_len": termination_trace.get("hit_max_seq_len"),
             }
 
     @torch.inference_mode()
