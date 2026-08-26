@@ -7,6 +7,7 @@ CUDA graphs for 6-10x speedup.
 
 import hashlib
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
@@ -24,6 +25,151 @@ from .streaming import _normalize_prefill_backend, clear_prefill_compile_cache
 from .utils import suppress_flash_attn_warning
 
 logger = logging.getLogger(__name__)
+
+
+def _use_codec_right_padded_decode() -> bool:
+    """Return whether the opt-in right-padded codec path is active."""
+
+    return os.environ.get("QTB_FASTER_CODEC_RIGHT_PADDED_DECODE") == "1"
+
+
+def _codec_right_padded_decode_window_frames() -> int:
+    """Return the configured fixed codec window size."""
+
+    raw_value = os.environ.get(
+        "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE_WINDOW_FRAMES", "80"
+    )
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE_WINDOW_FRAMES must be an integer"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE_WINDOW_FRAMES must be positive"
+        )
+    return value
+
+
+def _codec_right_padded_max_decode_input_frames() -> int:
+    """Return the verified context-plus-emission input bound."""
+
+    raw_value = os.environ.get(
+        "QTB_FASTER_CODEC_RIGHT_PADDED_MAX_DECODE_INPUT_FRAMES"
+    )
+    if raw_value is None:
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE=1 requires "
+            "QTB_FASTER_CODEC_RIGHT_PADDED_MAX_DECODE_INPUT_FRAMES"
+        )
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_MAX_DECODE_INPUT_FRAMES must be an integer"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_MAX_DECODE_INPUT_FRAMES must be positive"
+        )
+    return value
+
+
+def _use_codec_right_padded_cuda_graph() -> bool:
+    """Return whether the opt-in manual codec CUDA Graph is active."""
+
+    return os.environ.get("QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH") == "1"
+
+
+def _capture_right_padded_decoder_cuda_graph(base_model: Any) -> None:
+    """Capture the decoder graph for the configured fixed input shape."""
+
+    if not _use_codec_right_padded_cuda_graph():
+        return
+    if not _use_codec_right_padded_decode():
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH=1 requires "
+            "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE=1"
+        )
+    speech_tokenizer = getattr(
+        getattr(base_model, "model", None), "speech_tokenizer", None
+    )
+    decoder = getattr(getattr(speech_tokenizer, "model", None), "decoder", None)
+    capture_cuda_graph = getattr(decoder, "capture_cuda_graph", None)
+    if not callable(capture_cuda_graph):
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH=1 requires a compatible "
+            "12 Hz decoder with capture_cuda_graph"
+        )
+    window_size = _codec_right_padded_decode_window_frames()
+    logger.info(
+        "Capturing fixed-shape right-padded codec CUDA graph (window=%s)",
+        window_size,
+    )
+    capture_cuda_graph(window_size=window_size)
+
+
+def _decode_right_padded_window(
+    speech_tokenizer: Any,
+    audio_codes: torch.Tensor,
+    decode_window_frames: int,
+) -> tuple[list, int]:
+    """Decode a right-padded window while returning only its causal prefix."""
+
+    tokenizer_model = getattr(speech_tokenizer, "model", None)
+    decoder = getattr(tokenizer_model, "decoder", None)
+    forward_optimized = getattr(decoder, "forward_optimized", None)
+    total_upsample = getattr(decoder, "total_upsample", None)
+    sample_rate = getattr(speech_tokenizer, "get_output_sample_rate", None)
+    if not callable(forward_optimized) or not isinstance(
+        total_upsample, (int, np.integer)
+    ):
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE=1 requires a compatible 12 Hz decoder"
+        )
+    if not callable(sample_rate):
+        raise RuntimeError(
+            "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE=1 requires tokenizer sample-rate metadata"
+        )
+    if audio_codes.ndim != 2:
+        raise RuntimeError(
+            "right-padded codec decode requires [frames, quantizers] audio codes"
+        )
+    original_frames = int(audio_codes.shape[0])
+    if original_frames <= 0 or original_frames > decode_window_frames:
+        raise RuntimeError(
+            "fixed right-padded codec decode window does not contain its input: "
+            f"{original_frames} > {decode_window_frames}"
+        )
+    max_decode_input_frames = _codec_right_padded_max_decode_input_frames()
+    if original_frames > max_decode_input_frames:
+        raise RuntimeError(
+            "right-padded codec decode input exceeds the verified "
+            "context-plus-emission contract: "
+            f"{original_frames} > {max_decode_input_frames}"
+        )
+    codes = audio_codes.unsqueeze(0).transpose(1, 2)
+    if original_frames < decode_window_frames:
+        padding = torch.zeros(
+            codes.shape[0],
+            codes.shape[1],
+            decode_window_frames - original_frames,
+            dtype=codes.dtype,
+            device=codes.device,
+        )
+        codes = torch.cat((codes, padding), dim=-1)
+    else:
+        codes = codes.contiguous()
+    wav = forward_optimized(codes).squeeze(1)
+    fixed_delay_samples = (
+        decode_window_frames * int(total_upsample) - int(wav.shape[-1])
+    )
+    output_samples = original_frames * int(total_upsample) - fixed_delay_samples
+    if output_samples <= 0 or output_samples > int(wav.shape[-1]):
+        raise RuntimeError("right-padded codec decode produced an invalid output length")
+    audio = wav[..., :output_samples][0].to(torch.float32).detach().cpu().numpy()
+    return [audio], int(sample_rate())
 
 
 def _diagnostic_tensor_sha256(value: Any) -> str | None:
@@ -423,6 +569,8 @@ class FasterQwen3TTS:
             torch_dtype=dtype,
             attn_implementation=attn_implementation,
         )
+
+        _capture_right_padded_decoder_cuda_graph(base_model)
 
         talker = base_model.model.talker
         if normalized_prefill_compile_compat_mode is not None:
@@ -1830,9 +1978,16 @@ class FasterQwen3TTS:
                 codec_start_event = torch.cuda.Event(enable_timing=True)
                 codec_start_event.record()
             codec_decode_started = time.perf_counter()
-            audio_list, sr = speech_tokenizer.decode(
-                {"audio_codes": decode_input.unsqueeze(0)}
-            )
+            if _use_codec_right_padded_decode():
+                audio_list, sr = _decode_right_padded_window(
+                    speech_tokenizer,
+                    decode_input.to(talker.device),
+                    _codec_right_padded_decode_window_frames(),
+                )
+            else:
+                audio_list, sr = speech_tokenizer.decode(
+                    {"audio_codes": decode_input.unsqueeze(0)}
+                )
             speech_tokenizer_decode_wall_ms = (
                 time.perf_counter() - codec_decode_started
             ) * 1000
