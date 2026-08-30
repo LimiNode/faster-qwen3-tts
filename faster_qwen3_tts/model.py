@@ -1527,6 +1527,7 @@ class FasterQwen3TTS:
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
+        chunk_schedule: Optional[Iterable[int]] = None,
         xvec_only: bool = False,
         non_streaming_mode: Optional[bool] = None,
         append_silence: bool = True,
@@ -1587,7 +1588,17 @@ class FasterQwen3TTS:
             ref_codes=ref_codes,
         )
 
-        from .streaming import fast_generate_streaming, parity_generate_streaming
+        from .streaming import (
+            _normalize_chunk_schedule,
+            fast_generate_streaming,
+            parity_generate_streaming,
+        )
+
+        normalized_chunk_schedule = _normalize_chunk_schedule(chunk_schedule)
+        if parity_mode and normalized_chunk_schedule:
+            raise ValueError(
+                "voice-clone chunk_schedule requires the fast streaming path"
+            )
 
         non_streaming_mode = self._resolve_non_streaming_mode(
             non_streaming_mode,
@@ -1621,7 +1632,10 @@ class FasterQwen3TTS:
         # 2. Sliding window with 25-frame left context once calibrated (constant cost)
         # This avoids boundary artifacts (pops) while keeping decode cost bounded.
         context_frames = 25
-        min_calibration_frames = max(context_frames, chunk_size)
+        min_calibration_frames = max(
+            context_frames,
+            *(normalized_chunk_schedule or (chunk_size,)),
+        )
         all_codes = []
         prev_gen_audio_len = 0  # tracks position within the generated (non-ref) audio
         samples_per_frame = None
@@ -1649,6 +1663,8 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
         )
+        if normalized_chunk_schedule:
+            stream_kwargs["chunk_schedule"] = normalized_chunk_schedule
         if not parity_mode:
             stream_kwargs["predictor_graph"] = self._select_predictor_graph(do_sample)
             stream_kwargs["talker_graph"] = self.talker_graph

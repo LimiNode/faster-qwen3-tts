@@ -59,6 +59,7 @@ def test_public_api_exposes_voice_clone_prompt_parameter():
     sig_stream = inspect.signature(FasterQwen3TTS.generate_voice_clone_streaming)
     assert "voice_clone_prompt" in sig_clone.parameters
     assert "voice_clone_prompt" in sig_stream.parameters
+    assert "chunk_schedule" in sig_stream.parameters
     for name in ("ref_spk", "ref_rvq", "ref_spk_emb", "ref_codes"):
         assert name in sig_clone.parameters
         assert name in sig_stream.parameters
