@@ -21,6 +21,7 @@ _CMP_ENV_DEFAULTS = {
     "QTB_FASTER_GRAPH_FINITE_CHECKER": "0",
     "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE": "0",
     "QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH": "0",
+    "QTB_FASTER_BASE_REFERENCE_CONTEXT_BOOTSTRAP": "0",
 }
 
 
@@ -59,6 +60,7 @@ class Cmp50hxRuntimeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, _CMP_ENV_DEFAULTS):
             self.assertFalse(model._use_codec_right_padded_decode())
             self.assertFalse(model._use_codec_right_padded_cuda_graph())
+            self.assertFalse(model._use_base_reference_context_bootstrap())
             cmp50hx_diagnostic._installed = False
             cmp50hx_diagnostic.install()
             self.assertFalse(cmp50hx_diagnostic._installed)
@@ -156,6 +158,33 @@ class Cmp50hxRuntimeTests(unittest.TestCase):
             model._capture_right_padded_decoder_cuda_graph(_base_model(tokenizer))
 
         self.assertEqual(decoder.capture_windows, [48])
+
+    def test_base_reference_context_window_uses_exact_history_tail(self) -> None:
+        reference = torch.arange(90, dtype=torch.long).reshape(30, 3)
+        first_generated = torch.arange(24, dtype=torch.long).reshape(8, 3) + 100
+        second_generated = torch.arange(48, dtype=torch.long).reshape(16, 3) + 100
+
+        first_window = model._base_reference_context_window(
+            reference,
+            first_generated,
+            n_new=8,
+            context_frames=25,
+        )
+        second_window = model._base_reference_context_window(
+            reference,
+            second_generated,
+            n_new=8,
+            context_frames=25,
+        )
+
+        torch.testing.assert_close(
+            first_window,
+            torch.cat((reference[-25:], first_generated), dim=0),
+        )
+        torch.testing.assert_close(
+            second_window,
+            torch.cat((reference[-17:], second_generated), dim=0),
+        )
 
 
 if __name__ == "__main__":

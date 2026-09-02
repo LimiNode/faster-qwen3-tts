@@ -82,6 +82,45 @@ def _use_codec_right_padded_cuda_graph() -> bool:
     return os.environ.get("QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH") == "1"
 
 
+def _use_base_reference_context_bootstrap() -> bool:
+    """Return whether Base streaming may bootstrap from cached reference codes."""
+
+    return os.environ.get("QTB_FASTER_BASE_REFERENCE_CONTEXT_BOOTSTRAP") == "1"
+
+
+def _base_reference_context_window(
+    reference_codes: torch.Tensor,
+    generated_codes: torch.Tensor,
+    n_new: int,
+    context_frames: int,
+) -> torch.Tensor:
+    """Build one Base decode window from reference and generated codec history."""
+
+    if reference_codes.ndim != 2 or generated_codes.ndim != 2:
+        raise RuntimeError(
+            "Base reference-context bootstrap requires two-dimensional codec codes"
+        )
+    if reference_codes.shape[1] != generated_codes.shape[1]:
+        raise RuntimeError(
+            "Base reference and generated codec quantizer counts do not match"
+        )
+    if n_new <= 0 or n_new > int(generated_codes.shape[0]):
+        raise RuntimeError("Base reference-context bootstrap received invalid new frames")
+    if context_frames <= 0:
+        raise RuntimeError("Base reference-context bootstrap requires positive context")
+
+    reference_codes = reference_codes.to(generated_codes.device)
+    history = torch.cat((reference_codes, generated_codes), dim=0)
+    context_end = int(history.shape[0]) - n_new
+    context_start = context_end - context_frames
+    if context_start < 0:
+        raise RuntimeError(
+            "Base reference-context bootstrap does not have enough codec history"
+        )
+    decode_input = history[context_start:]
+    return decode_input
+
+
 def _capture_right_padded_decoder_cuda_graph(base_model: Any) -> None:
     """Capture the decoder graph for the configured fixed input shape."""
 
@@ -1636,9 +1675,27 @@ class FasterQwen3TTS:
             context_frames,
             *(normalized_chunk_schedule or (chunk_size,)),
         )
+        reference_context_bootstrap = _use_base_reference_context_bootstrap()
+        if reference_context_bootstrap:
+            if not _use_codec_right_padded_decode():
+                raise RuntimeError(
+                    "QTB_FASTER_BASE_REFERENCE_CONTEXT_BOOTSTRAP=1 requires "
+                    "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE=1"
+                )
+            if ref_codes is None or int(ref_codes.shape[0]) < context_frames:
+                raise RuntimeError(
+                    "Base reference-context bootstrap requires at least 25 "
+                    "reference codec frames"
+                )
+            samples_per_frame = int(speech_tokenizer.get_decode_upsample_rate())
+            logger.info(
+                "Using Base reference-context codec bootstrap (context=%s)",
+                context_frames,
+            )
+        else:
+            samples_per_frame = None
         all_codes = []
         prev_gen_audio_len = 0  # tracks position within the generated (non-ref) audio
-        samples_per_frame = None
         codec_hasher = hashlib.sha256() if diagnostics_enabled else None
         codec_frame_count = 0
         codec_prefix: list[list[int]] = []
@@ -1687,7 +1744,30 @@ class FasterQwen3TTS:
             all_flat = torch.cat(all_codes, dim=0)
             n_total = all_flat.shape[0]
 
-            if samples_per_frame is None:
+            if reference_context_bootstrap:
+                decode_input = _base_reference_context_window(
+                    ref_codes,
+                    all_flat,
+                    int(n_new),
+                    context_frames,
+                )
+                audio_list, sr = _decode_right_padded_window(
+                    speech_tokenizer,
+                    decode_input,
+                    _codec_right_padded_decode_window_frames(),
+                )
+                audio = audio_list[0]
+                if hasattr(audio, "cpu"):
+                    audio = audio.flatten().cpu().numpy()
+                else:
+                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
+                step_samples = int(n_new) * samples_per_frame
+                if step_samples <= 0 or step_samples > len(audio):
+                    raise RuntimeError(
+                        "Base reference-context codec bootstrap produced too little audio"
+                    )
+                new_audio = audio[-step_samples:]
+            elif samples_per_frame is None:
                 # Phase 1: accumulated decode until we can calibrate.
                 # In ICL mode prepend reference codes so the codec decoder has acoustic
                 # context from the reference audio (matches official implementation).
