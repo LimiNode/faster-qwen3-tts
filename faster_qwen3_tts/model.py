@@ -33,6 +33,29 @@ def _use_codec_right_padded_decode() -> bool:
     return os.environ.get("QTB_FASTER_CODEC_RIGHT_PADDED_DECODE") == "1"
 
 
+def _use_decode_backbone_compile() -> bool:
+    """Return whether the diagnostic tiny-decode compile path is active."""
+
+    return os.environ.get("QTB_FASTER_COMPILE_DECODE_GRAPHS") == "1"
+
+
+def _compile_decode_backbone(module: torch.nn.Module, label: str) -> torch.nn.Module:
+    """Compile one fixed-shape decode backbone before CUDA Graph capture."""
+
+    logger.warning(
+        "Enabling diagnostic torch.compile for %s decode backbone; "
+        "this is not a production profile",
+        label,
+    )
+    return torch.compile(
+        module,
+        backend="inductor",
+        fullgraph=False,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
+    )
+
+
 def _codec_right_padded_decode_window_frames() -> int:
     """Return the configured fixed codec window size."""
 
@@ -648,13 +671,33 @@ class FasterQwen3TTS:
             temperature=1.0,
         )
 
+        decode_compile_enabled = _use_decode_backbone_compile()
+        if decode_compile_enabled:
+            predictor_graph.pred_model = _compile_decode_backbone(
+                predictor_graph.pred_model,
+                "predictor",
+            )
+            predictor_graph_greedy.pred_model = _compile_decode_backbone(
+                predictor_graph_greedy.pred_model,
+                "predictor-greedy",
+            )
+            talker_graph_model = _compile_decode_backbone(
+                talker.model,
+                "talker",
+            )
+        else:
+            talker_graph_model = talker.model
+        predictor_graph.decode_compile_enabled = decode_compile_enabled
+        predictor_graph_greedy.decode_compile_enabled = decode_compile_enabled
+
         talker_graph = TalkerGraph(
-            talker.model,
+            talker_graph_model,
             talker_config,
             device=device,
             dtype=dtype,
             max_seq_len=max_seq_len,
         )
+        talker_graph.decode_compile_enabled = decode_compile_enabled
 
         logger.info("CUDA graphs initialized (will capture on first run)")
 

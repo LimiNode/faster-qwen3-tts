@@ -1270,6 +1270,9 @@ def fast_generate_streaming(
                     if getattr(predictor_graph, "returns_static_output", False)
                     else "clone"
                 )
+                prefill_profile["decode_backbone_compile_enabled"] = bool(
+                    getattr(predictor_graph, "decode_compile_enabled", False)
+                )
 
             _validate_chunk_steps(
                 len(chunk_buffer),
