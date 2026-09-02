@@ -39,6 +39,25 @@ def _use_decode_backbone_compile() -> bool:
     return os.environ.get("QTB_FASTER_COMPILE_DECODE_GRAPHS") == "1"
 
 
+def _profile_input_hashes_enabled() -> bool:
+    """Return whether diagnostic per-position talker input hashes are enabled."""
+
+    return os.environ.get("QTB_FASTER_PROFILE_INPUT_HASHES") == "1"
+
+
+def _talker_input_position_hashes(talker_input_embeds: torch.Tensor) -> list[str]:
+    """Hash each talker-input position for the opt-in prefix-invariance probe."""
+
+    # Convert through float32 so this remains portable for BF16 tensors, whose
+    # NumPy representation is not available on all supported runtimes.
+    host = talker_input_embeds.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    array = host.numpy()
+    return [
+        hashlib.sha256(array[:, index : index + 1, :].tobytes()).hexdigest()
+        for index in range(array.shape[1])
+    ]
+
+
 def _compile_decode_backbone(module: torch.nn.Module, label: str) -> torch.nn.Module:
     """Compile one fixed-shape decode backbone before CUDA Graph capture."""
 
@@ -1117,6 +1136,10 @@ class FasterQwen3TTS:
                 "tokenize_wall_ms": tokenize_wall_ms,
                 "build_talker_inputs_wall_ms": build_talker_inputs_wall_ms,
             }
+            if _profile_input_hashes_enabled():
+                metadata["talker_input_position_sha256"] = (
+                    _talker_input_position_hashes(tie)
+                )
             return m, talker, config, tie, tam, tth, tpe, ref_codes, metadata
 
         return m, talker, config, tie, tam, tth, tpe, ref_codes
