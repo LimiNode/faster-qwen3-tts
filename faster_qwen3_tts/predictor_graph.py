@@ -209,6 +209,12 @@ class PredictorGraph:
         Returns: [15] long tensor of codebook tokens
         """
         self.input_buf.copy_(pred_input)
-        self.static_cache.reset()
+        # No cache reset needed between replays: each replay writes KV positions
+        # 0..max_seq-1 (prefill fills 0-1, the unrolled decode steps fill the rest)
+        # before any attention reads them, so stale values are never attended.
         self.graph.replay()
         return self.output_tokens.clone()
+
+    def reset(self) -> None:
+        """Clear request-local cache metadata without recapturing the CUDA graph."""
+        self.static_cache.reset()

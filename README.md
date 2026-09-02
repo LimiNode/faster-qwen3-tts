@@ -299,6 +299,40 @@ The CUDA graphs are unchanged — both predictor and talker graphs are replayed 
 
 The Python streaming methods are pull-based generators: they prepare the next chunk when the caller requests it. For realtime local playback, use a queue-backed player such as `StreamPlayer`; blocking after each yielded chunk prevents generation and playback from overlapping.
 
+### Experimental CMP 50HX profile
+
+CMP 50HX support remains explicit and default-off. The validated numerical
+boundary keeps the layer-2 gate/up projections in FP16, performs their product
+and down projection in FP32, carries the residual and RMSNorm in FP32, and
+returns normalized branches to FP16. Enable that exact graph-compatible profile
+with:
+
+```text
+QTB_FASTER_MLP_FP32_ISLAND=1
+QTB_FASTER_MLP_NARROW_GATE_UP_FP16=1
+QTB_FASTER_GRAPH_RESIDUAL_CARRIER_FP32=1
+```
+
+The fixed-shape codec candidate is a separate opt-in. It right-pads future
+codec frames, trims the output to the causal prefix, and can capture the 12 Hz
+decoder's manual CUDA Graph:
+
+```text
+QTB_FASTER_CODEC_RIGHT_PADDED_DECODE=1
+QTB_FASTER_CODEC_RIGHT_PADDED_DECODE_WINDOW_FRAMES=48
+QTB_FASTER_CODEC_RIGHT_PADDED_MAX_DECODE_INPUT_FRAMES=41
+QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH=1
+```
+
+The maximum input must match the caller's context-plus-emission contract; an
+actual input above that bound fails closed. The value `41` above belongs to the
+validated fixed-E16 profile: 25 history frames plus 16 emitted frames. A caller
+using scheduled emission must instead set the bound to 25 plus the largest
+scheduled chunk, and that sum must still fit the configured decode window. For
+example, schedule `8,23` requires a bound of `48` with W48. These switches are
+not enabled by GPU-name detection and do not constitute an automatic
+production policy.
+
 ## Voice Cloning Quality
 
 ### Cloning modes
