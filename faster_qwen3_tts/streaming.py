@@ -78,6 +78,27 @@ class _DecodePhaseTimer:
     def __init__(self, device: torch.device, enabled: bool) -> None:
         self._enabled = bool(enabled and device.type == "cuda")
         self._pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self._frame_records: list[dict[str, Any]] = []
+        self._active_frame: dict[str, Any] | None = None
+
+    def begin_frame(self, frame_index: int) -> None:
+        if not self._enabled:
+            return
+        self._active_frame = {
+            "frame_index": int(frame_index),
+            "host_started": time.perf_counter(),
+            "pairs": {},
+        }
+
+    def end_frame(self) -> None:
+        if self._active_frame is None:
+            return
+        started = self._active_frame.pop("host_started")
+        self._active_frame["host_wall_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        self._frame_records.append(self._active_frame)
+        self._active_frame = None
 
     def begin(self, name: str) -> torch.cuda.Event | None:
         if not self._enabled:
@@ -92,12 +113,38 @@ class _DecodePhaseTimer:
         end = torch.cuda.Event(enable_timing=True)
         end.record()
         self._pairs.setdefault(name, []).append((start, end))
+        if self._active_frame is not None:
+            self._active_frame["pairs"].setdefault(name, []).append((start, end))
 
     def metrics(self) -> dict[str, float]:
         return {
             f"{name}_gpu_ms": sum(start.elapsed_time(end) for start, end in pairs)
             for name, pairs in self._pairs.items()
         }
+
+    def frame_metrics(self) -> list[dict[str, Any]]:
+        """Return per-frame GPU elapsed and host wall timings after synchronization."""
+
+        if not self._enabled:
+            return []
+        result = []
+        for record in self._frame_records:
+            phases = {
+                f"{name}_gpu_ms": sum(
+                    start.elapsed_time(end) for start, end in pairs
+                )
+                for name, pairs in record["pairs"].items()
+            }
+            gpu_total = sum(value for key, value in phases.items() if key.endswith("_gpu_ms"))
+            result.append(
+                {
+                    "frame_index": record["frame_index"],
+                    "host_wall_ms": record["host_wall_ms"],
+                    "gpu_total_ms": gpu_total,
+                    **phases,
+                }
+            )
+        return result
 
 
 def _normalize_prefill_backend(prefill_backend: str) -> str:
@@ -1098,6 +1145,8 @@ def fast_generate_streaming(
             )
             break
 
+        decode_phase_timer.begin_frame(step_idx)
+
         # --- CUDA-Graphed Code Predictor ---
         predictor_phase = decode_phase_timer.begin("ar_predictor_graph")
         last_id_hidden = talker_codec_embed(token.unsqueeze(1))
@@ -1134,6 +1183,7 @@ def fast_generate_streaming(
         # --- CUDA-Graphed Talker decode step ---
         current_pos = prefill_len + step_idx
         if current_pos >= talker_graph.max_seq_len - 1:
+            decode_phase_timer.end_frame()
             termination.update(
                 {
                     "termination_reason": "max_seq_len",
@@ -1175,6 +1225,7 @@ def fast_generate_streaming(
         past_hidden = hidden_states[:, -1:, :].clone()
         gen_step += 1
         decode_phase_timer.end("ar_state_update", state_phase)
+        decode_phase_timer.end_frame()
 
         # The optional schedule lowers time to first PCM without permanently
         # paying the smaller-chunk decode overhead in steady state.
@@ -1213,6 +1264,12 @@ def fast_generate_streaming(
             is_final_chunk = eos_found or step_idx + 1 >= max_new_tokens
             if chunk_count == 0:
                 prefill_profile.update(decode_phase_timer.metrics())
+                prefill_profile["ar_frame_timings"] = decode_phase_timer.frame_metrics()
+                prefill_profile["predictor_output_mode"] = (
+                    "static_view"
+                    if getattr(predictor_graph, "returns_static_output", False)
+                    else "clone"
+                )
 
             _validate_chunk_steps(
                 len(chunk_buffer),
