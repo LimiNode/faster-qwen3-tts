@@ -38,12 +38,21 @@ def _build_dummy_model():
     }
 
     model = FasterQwen3TTS(base, _dummy_graph(), _dummy_graph(), device="cpu", dtype=torch.float32)
-    model._build_talker_inputs_local = lambda **_kwargs: (
-        torch.zeros(1, 10, 4, dtype=torch.float32),
-        torch.ones(1, 10, dtype=torch.long),
-        torch.zeros(1, 1, 4, dtype=torch.float32),
-        torch.zeros(1, 1, 4, dtype=torch.float32),
-    )
+    def _build_talker_inputs_local(**kwargs):
+        result = (
+            torch.zeros(1, 10, 4, dtype=torch.float32),
+            torch.ones(1, 10, dtype=torch.long),
+            torch.zeros(1, 1, 4, dtype=torch.float32),
+            torch.zeros(1, 1, 4, dtype=torch.float32),
+        )
+        if kwargs.get("return_mask_metadata"):
+            return (*result, {
+                "prefill_attention_mask_all_valid": True,
+                "prefill_mask_decision_source": "constructed_all_ones",
+            })
+        return result
+
+    model._build_talker_inputs_local = _build_talker_inputs_local
     model.warmup = lambda _prefill_len: setattr(model, "_warmed_up", True)
     return model
 
@@ -66,7 +75,16 @@ def test_public_api_exposes_voice_clone_prompt_parameter():
     assert list(sig_clone.parameters).index("max_new_tokens") == 5
     assert list(sig_stream.parameters).index("max_new_tokens") == 5
     assert list(sig_clone.parameters)[-1] == "voice_clone_prompt"
-    assert list(sig_stream.parameters)[-1] == "voice_clone_prompt"
+    assert list(sig_stream.parameters)[-1] == "cancel_check"
+    for name in (
+        "profile_prefill",
+        "profile_nvtx",
+        "profile_request_role",
+        "prefill_backend",
+        "prefill_compile_compat_mode",
+        "cancel_check",
+    ):
+        assert name in sig_stream.parameters
     assert sig_clone.parameters["xvec_only"].default is False
     assert sig_clone.parameters["non_streaming_mode"].default is None
     assert sig_stream.parameters["xvec_only"].default is False

@@ -969,6 +969,7 @@ class FasterQwen3TTS:
         append_silence: bool = True,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
         instruct: Optional[str] = None,
+        return_metadata: bool = False,
     ):
         """Prepare inputs for generation (shared by streaming and non-streaming).
 
@@ -987,6 +988,7 @@ class FasterQwen3TTS:
             instruct: Optional instruction string to guide generation style/language (e.g.
                 "请用纯正广东话朗读"). Prepended as a user turn before the assistant TTS turn.
         """
+        tokenize_started = time.perf_counter()
         input_texts = [self.model._build_assistant_text(text)]
         input_ids = self.model._tokenize_texts(input_texts)
 
@@ -998,6 +1000,9 @@ class FasterQwen3TTS:
                 ]
             ]
 
+        tokenize_wall_ms = (time.perf_counter() - tokenize_started) * 1000
+
+        prompt_started = time.perf_counter()
         vcp, ref_ids, using_icl_mode = self._resolve_voice_clone_prompt(
             input_ids=input_ids,
             ref_audio=ref_audio,
@@ -1006,6 +1011,7 @@ class FasterQwen3TTS:
             append_silence=append_silence,
             voice_clone_prompt=voice_clone_prompt,
         )
+        prompt_resolution_wall_ms = (time.perf_counter() - prompt_started) * 1000
 
         if instruct and not using_icl_mode:
             logger.warning(
@@ -1017,7 +1023,8 @@ class FasterQwen3TTS:
 
         m = self.model.model
 
-        tie, tam, tth, tpe = self._build_talker_inputs_local(
+        build_started = time.perf_counter()
+        tie, tam, tth, tpe, mask_metadata = self._build_talker_inputs_local(
             m=m,
             input_ids=input_ids,
             ref_ids=ref_ids,
@@ -1026,7 +1033,9 @@ class FasterQwen3TTS:
             speakers=None,
             non_streaming_mode=non_streaming_mode,
             instruct_ids=instruct_ids,
+            return_mask_metadata=True,
         )
+        build_talker_inputs_wall_ms = (time.perf_counter() - build_started) * 1000
 
         if not self._warmed_up:
             self.warmup(tie.shape[1])
@@ -1040,6 +1049,32 @@ class FasterQwen3TTS:
         ref_codes = None
         if using_icl_mode and vcp.get("ref_code") and vcp["ref_code"][0] is not None:
             ref_codes = vcp["ref_code"][0]
+
+        if return_metadata:
+            instruct_id = instruct_ids[0] if instruct_ids else None
+            metadata = {
+                "text_token_count": int(input_ids[0].shape[-1]) if input_ids else 0,
+                "instruction_token_count": (
+                    int(instruct_id.shape[-1]) if instruct_id is not None else 0
+                ),
+                "talker_prefill_length": int(tie.shape[1]),
+                "prefill_batch_size": int(tie.shape[0]),
+                "voice_clone_prompt_mode": "icl" if using_icl_mode else "x_vector",
+                "voice_clone_prompt_source": (
+                    "precomputed" if voice_clone_prompt is not None else "reference"
+                ),
+                "voice_clone_prompt_resolution_wall_ms": prompt_resolution_wall_ms,
+                **mask_metadata,
+                "prefill_has_sliding_window": bool(
+                    getattr(talker_model_config, "sliding_window", None) is not None
+                ),
+                "prefill_attn_implementation": getattr(
+                    talker_model_config, "_attn_implementation", "eager"
+                ),
+                "tokenize_wall_ms": tokenize_wall_ms,
+                "build_talker_inputs_wall_ms": build_talker_inputs_wall_ms,
+            }
+            return m, talker, config, tie, tam, tth, tpe, ref_codes, metadata
 
         return m, talker, config, tie, tam, tth, tpe, ref_codes
 
@@ -1577,6 +1612,12 @@ class FasterQwen3TTS:
         ref_spk_emb: Optional[np.ndarray] = None,
         ref_codes: Optional[np.ndarray] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+        profile_prefill: bool = False,
+        profile_nvtx: bool = False,
+        profile_request_role: Optional[str] = None,
+        prefill_backend: Optional[str] = None,
+        prefill_compile_compat_mode: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         """
         Stream voice-cloned speech generation, yielding audio chunks.
@@ -1627,6 +1668,11 @@ class FasterQwen3TTS:
             ref_codes=ref_codes,
         )
 
+        prefill_compile_compat_mode = self._resolve_prefill_compile_compat_mode(
+            prefill_compile_compat_mode
+        )
+        prefill_backend = self._resolve_prefill_backend(prefill_backend)
+
         from .streaming import (
             _normalize_chunk_schedule,
             fast_generate_streaming,
@@ -1652,7 +1698,7 @@ class FasterQwen3TTS:
             if diagnostics_enabled
             else None
         )
-        m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
+        m, talker, config, tie, tam, tth, tpe, ref_codes, input_metadata = self._prepare_generation(
             text=text,
             language=language,
             ref_audio=ref_audio,
@@ -1662,7 +1708,10 @@ class FasterQwen3TTS:
             append_silence=append_silence,
             voice_clone_prompt=voice_clone_prompt,
             instruct=instruct,
+            return_metadata=True,
         )
+        if profile_request_role:
+            input_metadata["profile_request_role"] = profile_request_role
 
         speech_tokenizer = m.speech_tokenizer
 
@@ -1726,6 +1775,28 @@ class FasterQwen3TTS:
             stream_kwargs["predictor_graph"] = self._select_predictor_graph(do_sample)
             stream_kwargs["talker_graph"] = self.talker_graph
             stream_kwargs["termination_sink"] = termination_trace
+            stream_kwargs.update(
+                {
+                    "input_metadata": input_metadata,
+                    "profile_prefill": profile_prefill,
+                    "profile_nvtx": profile_nvtx,
+                    "prefill_backend": prefill_backend,
+                    "prefill_compile_compat_mode": prefill_compile_compat_mode,
+                    "prefill_compile_lengths": self.prefill_compile_lengths,
+                    "prefill_compile_on_miss": self.prefill_compile_on_miss,
+                    "prefill_unknown_shape_policy": self.prefill_unknown_shape_policy,
+                    "prefill_require_precompiled": self.prefill_require_precompiled,
+                    "cancel_check": cancel_check,
+                }
+            )
+        else:
+            stream_kwargs.update(
+                {
+                    "input_metadata": input_metadata,
+                    "profile_prefill": profile_prefill,
+                    "profile_nvtx": profile_nvtx,
+                }
+            )
 
         for codec_chunk, timing in stream_fn(**stream_kwargs):
             all_codes.append(codec_chunk)
