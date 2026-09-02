@@ -325,9 +325,13 @@ QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH=1
 ```
 
 The maximum input must match the caller's context-plus-emission contract; an
-actual input above that bound fails closed. W48 is validated only for 25 history
-frames plus 16 emitted frames. These switches are not enabled by GPU-name
-detection and do not constitute an automatic production policy.
+actual input above that bound fails closed. The value `41` above belongs to the
+validated fixed-E16 profile: 25 history frames plus 16 emitted frames. A caller
+using scheduled emission must instead set the bound to 25 plus the largest
+scheduled chunk, and that sum must still fit the configured decode window. For
+example, schedule `8,23` requires a bound of `48` with W48. These switches are
+not enabled by GPU-name detection and do not constitute an automatic
+production policy.
 
 ## Voice Cloning Quality
 
