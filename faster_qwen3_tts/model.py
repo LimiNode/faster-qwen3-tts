@@ -39,6 +39,12 @@ def _use_decode_backbone_compile() -> bool:
     return os.environ.get("QTB_FASTER_COMPILE_DECODE_GRAPHS") == "1"
 
 
+def _use_talker_only_decode_compile() -> bool:
+    """Return whether only the Talker decode backbone should be compiled."""
+
+    return os.environ.get("QTB_FASTER_COMPILE_TALKER_ONLY") == "1"
+
+
 def _profile_input_hashes_enabled() -> bool:
     """Return whether diagnostic per-position talker input hashes are enabled."""
 
@@ -705,7 +711,8 @@ class FasterQwen3TTS:
         )
 
         decode_compile_enabled = _use_decode_backbone_compile()
-        if decode_compile_enabled:
+        talker_only_compile = _use_talker_only_decode_compile()
+        if decode_compile_enabled and not talker_only_compile:
             predictor_graph.pred_model = _compile_decode_backbone(
                 predictor_graph.pred_model,
                 "predictor",
@@ -718,10 +725,20 @@ class FasterQwen3TTS:
                 talker.model,
                 "talker",
             )
+        elif talker_only_compile:
+            logger.warning(
+                "Enabling diagnostic torch.compile for Talker only; "
+                "predictor remains eager for parity isolation",
+            )
+            talker_graph_model = _compile_decode_backbone(
+                talker.model,
+                "talker",
+            )
         else:
             talker_graph_model = talker.model
-        predictor_graph.decode_compile_enabled = decode_compile_enabled
-        predictor_graph_greedy.decode_compile_enabled = decode_compile_enabled
+        decode_compile_active = decode_compile_enabled or talker_only_compile
+        predictor_graph.decode_compile_enabled = decode_compile_active
+        predictor_graph_greedy.decode_compile_enabled = decode_compile_active
 
         talker_graph = TalkerGraph(
             talker_graph_model,
@@ -730,7 +747,7 @@ class FasterQwen3TTS:
             dtype=dtype,
             max_seq_len=max_seq_len,
         )
-        talker_graph.decode_compile_enabled = decode_compile_enabled
+        talker_graph.decode_compile_enabled = decode_compile_active
 
         logger.info("CUDA graphs initialized (will capture on first run)")
 

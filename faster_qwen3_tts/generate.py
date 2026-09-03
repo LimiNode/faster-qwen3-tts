@@ -2,6 +2,7 @@
 """
 Non-streaming generation loop using CUDA graphs for both predictor and talker.
 """
+import os
 import time
 from typing import Optional, Tuple
 
@@ -13,6 +14,12 @@ from .sampling import apply_repetition_penalty, build_suppress_mask, sample_logi
 from .talker_graph import TalkerGraph
 
 _EOS_TRACKER_CACHE: dict = {}
+
+
+def _drop_prefill_hidden_states() -> bool:
+    """Return whether the diagnostic prefill memory optimization is enabled."""
+
+    return os.environ.get("QTB_FASTER_DROP_PREFILL_HIDDEN_STATES") == "1"
 
 
 def get_eos_tracker(device) -> tuple:
@@ -147,7 +154,7 @@ def fast_generate(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
         use_cache=True,
-        output_hidden_states=True,
+        output_hidden_states=not _drop_prefill_hidden_states(),
         return_dict=True,
         trailing_text_hidden=trailing_text_hiddens,
         tts_pad_embed=tts_pad_embed,
@@ -273,7 +280,9 @@ def fast_generate(
         next_slot = (step_idx + 1) % 2
         token_cpu[next_slot:next_slot + 1].copy_(token, non_blocking=True)
         token_events[next_slot].record()
-        past_hidden = hidden_states[:, -1:, :].clone()  # clone since it's the static buffer
+        # The next iteration reads this view before TalkerGraph.replay() can
+        # overwrite the static output buffer, so no per-frame clone is needed.
+        past_hidden = hidden_states[:, -1:, :]
         gen_step += 1
 
     torch.cuda.synchronize()

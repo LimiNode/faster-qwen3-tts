@@ -7,6 +7,7 @@ CUDA graph usage is identical to non-streaming — same per-step performance.
 """
 
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -36,6 +37,12 @@ _PREFILL_BACKENDS = {
     "compile_inductor_graphbreak",
     "compile_reduce_overhead",
 }
+
+
+def _drop_prefill_hidden_states() -> bool:
+    """Return whether the diagnostic prefill memory optimization is enabled."""
+
+    return os.environ.get("QTB_FASTER_DROP_PREFILL_HIDDEN_STATES") == "1"
 
 # Scheduled chunks are a latency feature, not a bulk-output control. Keeping
 # their target bounded prevents an accidental configuration from hiding output
@@ -805,7 +812,7 @@ def _talker_prefill_eager(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
         use_cache=True,
-        output_hidden_states=True,
+        output_hidden_states=not _drop_prefill_hidden_states(),
         return_dict=True,
         trailing_text_hidden=trailing_text_hiddens,
         tts_pad_embed=tts_pad_embed,
@@ -1382,7 +1389,10 @@ def fast_generate_streaming(
         next_slot = (step_idx + 1) % 2
         token_cpu[next_slot : next_slot + 1].copy_(token, non_blocking=True)
         token_events[next_slot].record()
-        past_hidden = hidden_states[:, -1:, :].clone()
+        # The next iteration consumes ``past_hidden`` before the next graph
+        # replay overwrites ``TalkerGraph.output_buf``.  Keep the static view
+        # instead of copying one hidden vector on every AR frame.
+        past_hidden = hidden_states[:, -1:, :]
         gen_step += 1
         decode_phase_timer.end("ar_state_update", state_phase)
         decode_phase_timer.end_frame()
@@ -1928,7 +1938,7 @@ def parity_generate_streaming(
             inputs_embeds=talker_input_embeds,
             attention_mask=attention_mask,
             use_cache=True,
-            output_hidden_states=True,
+            output_hidden_states=not _drop_prefill_hidden_states(),
             return_dict=True,
             trailing_text_hidden=trailing_text_hiddens,
             tts_pad_embed=tts_pad_embed,
