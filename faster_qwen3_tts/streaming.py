@@ -56,6 +56,25 @@ class UnsupportedPrefillConfiguration(ValueError):
     """Raised when a requested prefill backend/mask combination is unsafe."""
 
 
+def _prefix_split_probe_result() -> dict[str, Any]:
+    """Return the stable disabled/default shape for the split-forward probe."""
+
+    return {
+        "prefix_split_probe_enabled": False,
+        "prefix_split_probe_attempted": False,
+        "prefix_split_probe_supported": False,
+        "prefix_split_probe_prefix_length": 0,
+        "prefix_split_probe_error": None,
+        "prefix_split_probe_hidden_max_abs_delta": None,
+        "prefix_split_probe_hidden_mean_abs_delta": None,
+        "prefix_split_probe_logits_max_abs_delta": None,
+        "prefix_split_probe_logits_allclose": None,
+        "prefix_split_probe_kv_max_abs_delta": None,
+        "prefix_split_probe_kv_allclose": None,
+        "prefix_split_probe_first_token_match": None,
+    }
+
+
 class _CudaNvtxRange:
     def __init__(self, name: str, enabled: bool):
         self._name = name
@@ -866,6 +885,132 @@ def _tensor_signature(tensor: Optional[torch.Tensor]) -> tuple:
     )
 
 
+@torch.inference_mode()
+def _run_prefix_split_probe(
+    talker,
+    talker_input_embeds: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    full_out,
+    prefix_length: int,
+    *,
+    input_metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Compare one full talker prefill with a fresh prefix/suffix forward.
+
+    This is deliberately diagnostic-only.  The split result is never returned to
+    generation: it only measures whether a future per-voice KV-cache reuse path
+    could preserve the current full-prefill semantics.
+    """
+
+    result = _prefix_split_probe_result()
+    result["prefix_split_probe_enabled"] = True
+    result["prefix_split_probe_prefix_length"] = int(prefix_length)
+    total_length = int(talker_input_embeds.shape[1])
+    if (
+        talker_input_embeds.ndim != 3
+        or talker_input_embeds.shape[0] != 1
+        or prefix_length <= 0
+        or prefix_length >= total_length
+    ):
+        result["prefix_split_probe_error"] = "unsupported_shape_or_prefix"
+        return result
+    if not isinstance(input_metadata, dict) or (
+        input_metadata.get("prefill_attention_mask_all_valid") is not True
+        or input_metadata.get("prefill_has_sliding_window") is True
+    ):
+        result["prefix_split_probe_error"] = "requires_all_valid_non_sliding_profile"
+        return result
+    if attention_mask is not None and not bool(torch.all(attention_mask == 1).item()):
+        result["prefix_split_probe_error"] = "requires_all_ones_attention_mask"
+        return result
+
+    result["prefix_split_probe_attempted"] = True
+    try:
+        inner = getattr(talker, "model", None)
+        if inner is None:
+            raise RuntimeError("talker.model is unavailable")
+        cache_type = type(full_out.past_key_values)
+        split_cache = cache_type()
+        device = talker_input_embeds.device
+        full_attention = torch.ones(
+            (1, total_length), dtype=torch.long, device=device
+        )
+        positions = torch.arange(total_length, device=device, dtype=torch.long)
+        position_ids = positions.view(1, 1, -1).expand(3, 1, -1)
+        prefix_out = inner(
+            inputs_embeds=talker_input_embeds[:, :prefix_length],
+            attention_mask=full_attention[:, :prefix_length],
+            position_ids=position_ids[:, :, :prefix_length],
+            past_key_values=split_cache,
+            use_cache=True,
+            output_hidden_states=True,
+            cache_position=positions[:prefix_length],
+        )
+        suffix_out = inner(
+            inputs_embeds=talker_input_embeds[:, prefix_length:],
+            attention_mask=full_attention,
+            position_ids=position_ids[:, :, prefix_length:],
+            past_key_values=prefix_out.past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            cache_position=positions[prefix_length:],
+        )
+
+        full_hidden = getattr(full_out, "last_hidden_state", None)
+        if full_hidden is None:
+            hidden_states = getattr(full_out, "hidden_states", None)
+            if hidden_states and isinstance(hidden_states[0], tuple):
+                full_hidden = hidden_states[0][-1]
+            elif hidden_states:
+                full_hidden = hidden_states[-1]
+        split_hidden = suffix_out.last_hidden_state
+        if full_hidden is None or split_hidden is None:
+            raise RuntimeError("hidden state output is unavailable")
+        full_suffix = full_hidden[:, prefix_length:]
+        hidden_delta = (split_hidden.float() - full_suffix.float()).abs()
+        result["prefix_split_probe_hidden_max_abs_delta"] = float(hidden_delta.max().item())
+        result["prefix_split_probe_hidden_mean_abs_delta"] = float(hidden_delta.mean().item())
+
+        split_logits = talker.codec_head(split_hidden)
+        full_logits = getattr(full_out, "logits", None)
+        if full_logits is not None:
+            logits_delta = (split_logits.float() - full_logits[:, prefix_length:].float()).abs()
+            result["prefix_split_probe_logits_max_abs_delta"] = float(logits_delta.max().item())
+            result["prefix_split_probe_logits_allclose"] = bool(
+                torch.allclose(split_logits, full_logits[:, prefix_length:], rtol=5e-2, atol=5e-2)
+            )
+            result["prefix_split_probe_first_token_match"] = bool(
+                torch.argmax(split_logits[:, 0], dim=-1).item()
+                == torch.argmax(full_logits[:, prefix_length], dim=-1).item()
+            )
+
+        full_cache = full_out.past_key_values
+        split_cache = suffix_out.past_key_values
+        kv_max = 0.0
+        kv_allclose = True
+        layers = getattr(full_cache, "layers", None)
+        split_layers = getattr(split_cache, "layers", None)
+        if layers is None or split_layers is None or len(layers) != len(split_layers):
+            raise RuntimeError("unsupported cache representation")
+        for full_layer, split_layer in zip(layers, split_layers):
+            for name in ("keys", "values"):
+                full_tensor = getattr(full_layer, name, None)
+                split_tensor = getattr(split_layer, name, None)
+                if full_tensor is None or split_tensor is None:
+                    raise RuntimeError("cache layer tensors are unavailable")
+                delta = (split_tensor.float() - full_tensor.float()).abs()
+                kv_max = max(kv_max, float(delta.max().item()))
+                kv_allclose = kv_allclose and bool(
+                    torch.allclose(split_tensor, full_tensor, rtol=5e-2, atol=5e-2)
+                )
+        result["prefix_split_probe_kv_max_abs_delta"] = kv_max
+        result["prefix_split_probe_kv_allclose"] = kv_allclose
+        result["prefix_split_probe_supported"] = True
+    except Exception as exc:  # diagnostic probes must never break synthesis
+        result["prefix_split_probe_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def _jsonable_tensor_signature(signature: tuple) -> tuple:
     if not signature or signature[0] == "none":
         return signature
@@ -907,6 +1052,8 @@ def fast_generate_streaming(
     prefill_compile_on_miss: bool = True,
     prefill_unknown_shape_policy: str = "eager",
     prefill_require_precompiled: bool = False,
+    prefix_split_probe_enabled: bool = False,
+    prefix_split_probe_prefix_length: int = 86,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
@@ -952,6 +1099,8 @@ def fast_generate_streaming(
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.perf_counter()
     prefill_profile = {}
+    prefill_profile.update(_prefix_split_probe_result())
+    prefill_profile["prefix_split_probe_enabled"] = bool(prefix_split_probe_enabled)
     prefill_events = _PrefillEvents(device, profile_prefill)
     nvtx_enabled = profile_nvtx and device.type == "cuda"
     outer_nvtx_name = _profile_outer_nvtx_name(input_metadata)
@@ -983,6 +1132,17 @@ def fast_generate_streaming(
         time.perf_counter() - forward_started
     ) * 1000
     prefill_profile.update(backend_profile)
+    if prefix_split_probe_enabled:
+        prefill_profile.update(
+            _run_prefix_split_probe(
+                talker,
+                talker_input_embeds,
+                attention_mask,
+                out,
+                int(prefix_split_probe_prefix_length),
+                input_metadata=input_metadata,
+            )
+        )
     normalized_chunk_schedule, schedule_decision = _select_chunk_schedule_for_prefill_route(
         normalized_chunk_schedule,
         compiled_chunk_schedule,

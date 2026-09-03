@@ -14,6 +14,21 @@ from faster_qwen3_tts.streaming import UnsupportedPrefillConfiguration
 from faster_qwen3_tts.streaming import select_prefill_mask_mode
 
 
+def test_prefix_split_probe_rejects_unsafe_profile_without_running_model():
+    result = streaming._run_prefix_split_probe(
+        None,
+        torch.zeros(1, 10, 4),
+        None,
+        types.SimpleNamespace(),
+        4,
+        input_metadata={},
+    )
+    assert result["prefix_split_probe_enabled"] is True
+    assert result["prefix_split_probe_attempted"] is False
+    assert result["prefix_split_probe_supported"] is False
+    assert result["prefix_split_probe_error"] == "requires_all_valid_non_sliding_profile"
+
+
 def test_repetition_penalty_uses_all_history():
     logits = torch.zeros(1, 1, 10)
     logits[..., 7] = 1.0

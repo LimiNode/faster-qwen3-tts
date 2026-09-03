@@ -45,6 +45,20 @@ def _profile_input_hashes_enabled() -> bool:
     return os.environ.get("QTB_FASTER_PROFILE_INPUT_HASHES") == "1"
 
 
+def _prefix_split_probe_config() -> tuple[bool, int]:
+    """Return opt-in split-forward probe settings from diagnostic environment."""
+
+    if os.environ.get("QTB_FASTER_PREFIX_SPLIT_PROBE") != "1":
+        return False, 86
+    raw_length = os.environ.get("QTB_FASTER_PREFIX_SPLIT_PROBE_LENGTH", "86")
+    try:
+        length = int(raw_length)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid QTB_FASTER_PREFIX_SPLIT_PROBE_LENGTH=%r", raw_length)
+        length = 86
+    return True, max(1, length)
+
+
 def _talker_input_position_hashes(talker_input_embeds: torch.Tensor) -> list[str]:
     """Hash each talker-input position for the opt-in prefix-invariance probe."""
 
@@ -1835,6 +1849,9 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
         )
+        prefix_split_probe_enabled, prefix_split_probe_prefix_length = (
+            _prefix_split_probe_config()
+        )
         if normalized_chunk_schedule:
             stream_kwargs["chunk_schedule"] = normalized_chunk_schedule
         if not parity_mode:
@@ -1852,6 +1869,8 @@ class FasterQwen3TTS:
                     "prefill_compile_on_miss": self.prefill_compile_on_miss,
                     "prefill_unknown_shape_policy": self.prefill_unknown_shape_policy,
                     "prefill_require_precompiled": self.prefill_require_precompiled,
+                    "prefix_split_probe_enabled": prefix_split_probe_enabled,
+                    "prefix_split_probe_prefix_length": prefix_split_probe_prefix_length,
                     "cancel_check": cancel_check,
                 }
             )
