@@ -20,6 +20,7 @@ from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from .sampling import sample_logits
+from .attention_backend import sdpa_kernel_context
 
 
 class PredictorGraph:
@@ -182,7 +183,8 @@ class PredictorGraph:
 
         for _ in range(num_warmup):
             self.static_cache.reset()
-            self._full_loop()
+            with sdpa_kernel_context():
+                self._full_loop()
         torch.cuda.synchronize()
 
         print("Capturing CUDA graph for predictor...")
@@ -194,12 +196,14 @@ class PredictorGraph:
                 self.graph = torch.cuda.CUDAGraph()
                 # Warmup in capture stream
                 self.static_cache.reset()
-                self._full_loop()
+                with sdpa_kernel_context():
+                    self._full_loop()
                 torch.cuda.synchronize()
 
                 self.static_cache.reset()
-                with torch.cuda.graph(self.graph):
-                    self._full_loop()
+                with sdpa_kernel_context():
+                    with torch.cuda.graph(self.graph):
+                        self._full_loop()
 
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()

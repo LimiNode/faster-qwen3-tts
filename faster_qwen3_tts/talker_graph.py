@@ -19,6 +19,8 @@ import torch
 from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
+from .attention_backend import sdpa_kernel_context
+
 
 class TalkerGraph:
     """
@@ -134,7 +136,8 @@ class TalkerGraph:
         self._set_attention_mask(prefill_len)
 
         for _ in range(num_warmup):
-            self._decode_step()
+            with sdpa_kernel_context():
+                self._decode_step()
         torch.cuda.synchronize()
 
         print("Capturing CUDA graph for talker decode...")
@@ -146,11 +149,13 @@ class TalkerGraph:
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 # Warmup in capture stream
-                self._decode_step()
+                with sdpa_kernel_context():
+                    self._decode_step()
                 torch.cuda.synchronize()
 
-                with torch.cuda.graph(self.graph):
-                    self._decode_step()
+                with sdpa_kernel_context():
+                    with torch.cuda.graph(self.graph):
+                        self._decode_step()
 
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
