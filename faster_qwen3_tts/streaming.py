@@ -1442,6 +1442,13 @@ def fast_generate_streaming(
                 )
                 prefill_profile["decode_backbone_compile_enabled"] = bool(
                     getattr(predictor_graph, "decode_compile_enabled", False)
+                    or getattr(talker_graph, "decode_compile_enabled", False)
+                )
+                prefill_profile["predictor_decode_compile_enabled"] = bool(
+                    getattr(predictor_graph, "decode_compile_enabled", False)
+                )
+                prefill_profile["talker_decode_compile_enabled"] = bool(
+                    getattr(talker_graph, "decode_compile_enabled", False)
                 )
 
             _validate_chunk_steps(

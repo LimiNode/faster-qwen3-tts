@@ -736,9 +736,10 @@ class FasterQwen3TTS:
             )
         else:
             talker_graph_model = talker.model
-        decode_compile_active = decode_compile_enabled or talker_only_compile
-        predictor_graph.decode_compile_enabled = decode_compile_active
-        predictor_graph_greedy.decode_compile_enabled = decode_compile_active
+        predictor_compile_active = decode_compile_enabled and not talker_only_compile
+        talker_compile_active = decode_compile_enabled or talker_only_compile
+        predictor_graph.decode_compile_enabled = predictor_compile_active
+        predictor_graph_greedy.decode_compile_enabled = predictor_compile_active
 
         talker_graph = TalkerGraph(
             talker_graph_model,
@@ -747,7 +748,7 @@ class FasterQwen3TTS:
             dtype=dtype,
             max_seq_len=max_seq_len,
         )
-        talker_graph.decode_compile_enabled = decode_compile_active
+        talker_graph.decode_compile_enabled = talker_compile_active
 
         logger.info("CUDA graphs initialized (will capture on first run)")
 
