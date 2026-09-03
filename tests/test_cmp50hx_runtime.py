@@ -18,6 +18,7 @@ _CMP_ENV_DEFAULTS = {
     "QTB_FASTER_RESIDUAL_CARRIER_FP32": "0",
     "QTB_FASTER_GRAPH_RESIDUAL_CARRIER_FP32": "0",
     "QTB_FASTER_MLP_NARROW_GATE_UP_FP16": "0",
+    "QTB_FASTER_MLP_TRITON_SILU_MUL": "0",
     "QTB_FASTER_GRAPH_FINITE_CHECKER": "0",
     "QTB_FASTER_CODEC_RIGHT_PADDED_DECODE": "0",
     "QTB_FASTER_CODEC_RIGHT_PADDED_CUDA_GRAPH": "0",
@@ -82,6 +83,7 @@ class Cmp50hxRuntimeTests(unittest.TestCase):
             )
             self.assertFalse(cmp50hx_diagnostic._enabled())
             self.assertFalse(cmp50hx_diagnostic._residual_carrier_fp32_enabled())
+            self.assertFalse(cmp50hx_diagnostic._mlp_triton_silu_mul_enabled())
             self.assertFalse(cmp50hx_diagnostic._graph_finite_checker_enabled())
 
     def test_right_padding_preserves_shape_and_causal_prefix(self) -> None:

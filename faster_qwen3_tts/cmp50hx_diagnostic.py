@@ -20,6 +20,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+try:  # Triton is optional; the production/default path must not depend on it.
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - exercised only without Triton
+    triton = None
+    tl = None
+
 _ENV_ENABLED = "QTB_FASTER_EAGER_DIAGNOSTIC"
 _ENV_TRACE = "QTB_FASTER_DIAGNOSTIC_TRACE_PATH"
 _ENV_MLP_FP32_ISLAND = "QTB_FASTER_MLP_FP32_ISLAND"
@@ -28,6 +35,7 @@ _ENV_GRAPH_RESIDUAL_CARRIER_FP32 = "QTB_FASTER_GRAPH_RESIDUAL_CARRIER_FP32"
 _ENV_GRAPH_CARRIER_PROOF = "QTB_FASTER_GRAPH_CARRIER_PROOF_PATH"
 _ENV_MLP_NARROW_GATE_UP_FP16 = "QTB_FASTER_MLP_NARROW_GATE_UP_FP16"
 _ENV_MLP_FUSED_GATE_UP = "QTB_FASTER_MLP_FUSED_GATE_UP"
+_ENV_MLP_TRITON_SILU_MUL = "QTB_FASTER_MLP_TRITON_SILU_MUL"
 _ENV_GRAPH_FINITE_CHECKER = "QTB_FASTER_GRAPH_FINITE_CHECKER"
 _ENV_GRAPH_FINITE_PROOF = "QTB_FASTER_GRAPH_FINITE_PROOF_PATH"
 _ENV_START_REQUEST = "QTB_FASTER_DIAGNOSTIC_START_REQUEST"
@@ -59,6 +67,40 @@ def _mlp_narrow_gate_up_fp16_enabled() -> bool:
 
 def _mlp_fused_gate_up_enabled() -> bool:
     return os.environ.get(_ENV_MLP_FUSED_GATE_UP) == "1"
+
+
+def _mlp_triton_silu_mul_enabled() -> bool:
+    return os.environ.get(_ENV_MLP_TRITON_SILU_MUL) == "1"
+
+
+if triton is not None:
+
+    @triton.jit
+    def _silu_mul_fp32_kernel(
+        gate_ptr,
+        up_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Compute FP32 SiLU(gate) * up for a contiguous flattened row."""
+
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        gate = tl.load(gate_ptr + offsets, mask=mask, other=0).to(tl.float32)
+        up = tl.load(up_ptr + offsets, mask=mask, other=0).to(tl.float32)
+        # Match the reference operation order: sigmoid(gate), then multiply
+        # by gate and up in FP32.
+        sigmoid = tl.sigmoid(gate)
+        product = sigmoid * gate
+        product = product * up
+        tl.store(output_ptr + offsets, product, mask=mask)
+
+else:
+
+    def _silu_mul_fp32_kernel(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("Triton is not available")
 
 
 def _graph_finite_checker_enabled() -> bool:
@@ -355,6 +397,98 @@ def _install_layer2_mlp_narrow_gate_up_fp16(owner: Any) -> None:
         torch.sigmoid(gate_fp32, out=product)
         product.mul_(gate_fp32)
         product.mul_(up_fp32)
+        _observe_graph_finite(owner, "layer2_silu_times_up_fp32", product)
+        torch.mm(product, mlp._cmp50hx_down_weight_fp32.t(), out=down)
+        if mlp._cmp50hx_down_bias_fp32 is not None:
+            down.add_(mlp._cmp50hx_down_bias_fp32)
+        _observe_graph_finite(owner, "layer2_down_fp32", down)
+        output.copy_(down.unsqueeze(0))
+        _observe_graph_finite(owner, "layer2_output_fp16", output)
+        return output
+
+    mlp.forward = forward
+    mlp._cmp50hx_fp32_island_installed = True
+
+
+def _install_layer2_mlp_triton_silu_mul(owner: Any) -> None:
+    """Use Triton only for the FP32 SiLU-times-up elementwise boundary.
+
+    The two FP16 projection GEMMs, FP32 down projection, and FP16 output copy
+    intentionally remain identical to the narrow reference path.  This keeps
+    the numerical experiment focused on launch/copy overhead and makes a
+    fixed-seed codec-hash comparison meaningful.
+    """
+
+    if triton is None:
+        raise RuntimeError(
+            "QTB_FASTER_MLP_TRITON_SILU_MUL=1 requires the optional Triton package"
+        )
+    layer_index = 2
+    mlp = owner.pred_model.layers[layer_index].mlp
+    if getattr(mlp, "_cmp50hx_fp32_island_installed", False):
+        return
+
+    max_tokens = 2
+    intermediate_size = mlp.gate_proj.weight.shape[0]
+    hidden_size = mlp.down_proj.weight.shape[0]
+    device = owner.device
+    mlp._cmp50hx_down_weight_fp32 = mlp.down_proj.weight.detach().float()
+    down_bias = getattr(mlp.down_proj, "bias", None)
+    mlp._cmp50hx_down_bias_fp32 = (
+        down_bias.detach().float() if down_bias is not None else None
+    )
+    mlp._cmp50hx_product_fp32 = torch.empty(
+        (max_tokens, intermediate_size), dtype=torch.float32, device=device
+    )
+    mlp._cmp50hx_down_fp32 = torch.empty(
+        (max_tokens, hidden_size), dtype=torch.float32, device=device
+    )
+    mlp._cmp50hx_output_fp16 = torch.empty(
+        (1, max_tokens, hidden_size), dtype=torch.float16, device=device
+    )
+
+    # Compile the kernel before FasterQwen enters CUDA graph capture.  Triton
+    # compilation is a host-side operation and is not capture-safe on first
+    # launch.  The temporary buffers are never used by model execution.
+    warmup_gate = torch.zeros(
+        intermediate_size, dtype=torch.float16, device=device
+    )
+    warmup_up = torch.zeros_like(warmup_gate)
+    warmup_product = torch.empty(
+        intermediate_size, dtype=torch.float32, device=device
+    )
+    _silu_mul_fp32_kernel[(triton.cdiv(intermediate_size, 256),)](
+        warmup_gate,
+        warmup_up,
+        warmup_product,
+        intermediate_size,
+        BLOCK_SIZE=256,
+        num_warps=4,
+    )
+
+    mlp._cmp50hx_precision_variant = "narrow_gate_up_fp16_triton_silu_mul"
+    mlp._cmp50hx_gate_up_compute_dtype = "float16"
+    mlp._cmp50hx_product_compute_dtype = "float32"
+    mlp._cmp50hx_down_compute_dtype = "float32"
+
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        sequence_length = x.shape[1]
+        gate_fp16 = F.linear(x, mlp.gate_proj.weight)
+        up_fp16 = F.linear(x, mlp.up_proj.weight)
+        _observe_graph_finite(owner, "layer2_gate_fp16", gate_fp16)
+        _observe_graph_finite(owner, "layer2_up_fp16", up_fp16)
+        product = mlp._cmp50hx_product_fp32[:sequence_length]
+        down = mlp._cmp50hx_down_fp32[:sequence_length]
+        output = mlp._cmp50hx_output_fp16[:, :sequence_length, :]
+        n_elements = sequence_length * intermediate_size
+        _silu_mul_fp32_kernel[(triton.cdiv(n_elements, 256),)](
+            gate_fp16.reshape(-1),
+            up_fp16.reshape(-1),
+            product.reshape(-1),
+            n_elements,
+            BLOCK_SIZE=256,
+            num_warps=4,
+        )
         _observe_graph_finite(owner, "layer2_silu_times_up_fp32", product)
         torch.mm(product, mlp._cmp50hx_down_weight_fp32.t(), out=down)
         if mlp._cmp50hx_down_bias_fp32 is not None:
@@ -1055,6 +1189,7 @@ def install() -> None:
         or _residual_carrier_fp32_enabled()
         or _graph_residual_carrier_fp32_enabled()
         or _mlp_fused_gate_up_enabled()
+        or _mlp_triton_silu_mul_enabled()
         or _graph_finite_checker_enabled()
     ):
         return
@@ -1123,7 +1258,9 @@ def install() -> None:
                 self._cmp50hx_diagnostic_handles.append(
                     module.register_forward_hook(_record_projection(self, layer_index, component))
                 )
-        if _mlp_fused_gate_up_enabled():
+        if _mlp_triton_silu_mul_enabled():
+            _install_layer2_mlp_triton_silu_mul(self)
+        elif _mlp_fused_gate_up_enabled():
             _install_layer2_mlp_fused_gate_up(self)
         elif _mlp_fp32_island_enabled() and _mlp_narrow_gate_up_fp16_enabled():
             _install_layer2_mlp_narrow_gate_up_fp16(self)
