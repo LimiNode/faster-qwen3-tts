@@ -27,6 +27,7 @@ _ENV_RESIDUAL_CARRIER_FP32 = "QTB_FASTER_RESIDUAL_CARRIER_FP32"
 _ENV_GRAPH_RESIDUAL_CARRIER_FP32 = "QTB_FASTER_GRAPH_RESIDUAL_CARRIER_FP32"
 _ENV_GRAPH_CARRIER_PROOF = "QTB_FASTER_GRAPH_CARRIER_PROOF_PATH"
 _ENV_MLP_NARROW_GATE_UP_FP16 = "QTB_FASTER_MLP_NARROW_GATE_UP_FP16"
+_ENV_MLP_FUSED_GATE_UP = "QTB_FASTER_MLP_FUSED_GATE_UP"
 _ENV_GRAPH_FINITE_CHECKER = "QTB_FASTER_GRAPH_FINITE_CHECKER"
 _ENV_GRAPH_FINITE_PROOF = "QTB_FASTER_GRAPH_FINITE_PROOF_PATH"
 _ENV_START_REQUEST = "QTB_FASTER_DIAGNOSTIC_START_REQUEST"
@@ -54,6 +55,10 @@ def _graph_residual_carrier_fp32_enabled() -> bool:
 
 def _mlp_narrow_gate_up_fp16_enabled() -> bool:
     return os.environ.get(_ENV_MLP_NARROW_GATE_UP_FP16) == "1"
+
+
+def _mlp_fused_gate_up_enabled() -> bool:
+    return os.environ.get(_ENV_MLP_FUSED_GATE_UP) == "1"
 
 
 def _graph_finite_checker_enabled() -> bool:
@@ -357,6 +362,71 @@ def _install_layer2_mlp_narrow_gate_up_fp16(owner: Any) -> None:
         _observe_graph_finite(owner, "layer2_down_fp32", down)
         output.copy_(down.unsqueeze(0))
         _observe_graph_finite(owner, "layer2_output_fp16", output)
+        return output
+
+    mlp.forward = forward
+    mlp._cmp50hx_fp32_island_installed = True
+
+
+def _install_layer2_mlp_fused_gate_up(owner: Any) -> None:
+    """Fuse FP16 gate/up projections while retaining the proven FP32 tail."""
+
+    layer_index = 2
+    mlp = owner.pred_model.layers[layer_index].mlp
+    if getattr(mlp, "_cmp50hx_fp32_island_installed", False):
+        return
+
+    max_tokens = 2
+    intermediate_size = mlp.gate_proj.weight.shape[0]
+    hidden_size = mlp.down_proj.weight.shape[0]
+    device = owner.device
+    mlp._cmp50hx_fused_gate_up_weight = torch.cat(
+        [mlp.gate_proj.weight.detach(), mlp.up_proj.weight.detach()], dim=0
+    ).contiguous()
+    mlp._cmp50hx_down_weight_fp32 = mlp.down_proj.weight.detach().float()
+    down_bias = getattr(mlp.down_proj, "bias", None)
+    mlp._cmp50hx_down_bias_fp32 = (
+        down_bias.detach().float() if down_bias is not None else None
+    )
+    mlp._cmp50hx_gate_fp32 = torch.empty(
+        (max_tokens, intermediate_size), dtype=torch.float32, device=device
+    )
+    mlp._cmp50hx_up_fp32 = torch.empty(
+        (max_tokens, intermediate_size), dtype=torch.float32, device=device
+    )
+    mlp._cmp50hx_product_fp32 = torch.empty(
+        (max_tokens, intermediate_size), dtype=torch.float32, device=device
+    )
+    mlp._cmp50hx_down_fp32 = torch.empty(
+        (max_tokens, hidden_size), dtype=torch.float32, device=device
+    )
+    mlp._cmp50hx_output_fp16 = torch.empty(
+        (1, max_tokens, hidden_size), dtype=torch.float16, device=device
+    )
+    mlp._cmp50hx_precision_variant = "fused_gate_up_fp16_fp32_tail"
+    mlp._cmp50hx_gate_up_compute_dtype = "float16"
+    mlp._cmp50hx_product_compute_dtype = "float32"
+    mlp._cmp50hx_down_compute_dtype = "float32"
+
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        sequence_length = x.shape[1]
+        fused = F.linear(x, mlp._cmp50hx_fused_gate_up_weight)
+        gate_fp16 = fused[..., :intermediate_size]
+        up_fp16 = fused[..., intermediate_size:]
+        gate_fp32 = mlp._cmp50hx_gate_fp32[:sequence_length]
+        up_fp32 = mlp._cmp50hx_up_fp32[:sequence_length]
+        product = mlp._cmp50hx_product_fp32[:sequence_length]
+        down = mlp._cmp50hx_down_fp32[:sequence_length]
+        output = mlp._cmp50hx_output_fp16[:, :sequence_length, :]
+        gate_fp32.copy_(gate_fp16.reshape(sequence_length, -1))
+        up_fp32.copy_(up_fp16.reshape(sequence_length, -1))
+        torch.sigmoid(gate_fp32, out=product)
+        product.mul_(gate_fp32)
+        product.mul_(up_fp32)
+        torch.mm(product, mlp._cmp50hx_down_weight_fp32.t(), out=down)
+        if mlp._cmp50hx_down_bias_fp32 is not None:
+            down.add_(mlp._cmp50hx_down_bias_fp32)
+        output.copy_(down.unsqueeze(0))
         return output
 
     mlp.forward = forward
@@ -984,6 +1054,7 @@ def install() -> None:
         or _mlp_fp32_island_enabled()
         or _residual_carrier_fp32_enabled()
         or _graph_residual_carrier_fp32_enabled()
+        or _mlp_fused_gate_up_enabled()
         or _graph_finite_checker_enabled()
     ):
         return
@@ -1052,7 +1123,9 @@ def install() -> None:
                 self._cmp50hx_diagnostic_handles.append(
                     module.register_forward_hook(_record_projection(self, layer_index, component))
                 )
-        if _mlp_fp32_island_enabled() and _mlp_narrow_gate_up_fp16_enabled():
+        if _mlp_fused_gate_up_enabled():
+            _install_layer2_mlp_fused_gate_up(self)
+        elif _mlp_fp32_island_enabled() and _mlp_narrow_gate_up_fp16_enabled():
             _install_layer2_mlp_narrow_gate_up_fp16(self)
         elif _mlp_fp32_island_enabled():
             _install_layer2_mlp_fp32_island(self)
