@@ -62,6 +62,7 @@ class Cmp50hxRuntimeTests(unittest.TestCase):
             self.assertFalse(model._use_codec_right_padded_decode())
             self.assertFalse(model._use_codec_right_padded_cuda_graph())
             self.assertFalse(model._use_base_reference_context_bootstrap())
+            self.assertFalse(model._use_async_codec_decode())
             cmp50hx_diagnostic._installed = False
             cmp50hx_diagnostic.install()
             self.assertFalse(cmp50hx_diagnostic._installed)

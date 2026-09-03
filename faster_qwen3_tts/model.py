@@ -8,6 +8,8 @@ CUDA graphs for 6-10x speedup.
 import hashlib
 import logging
 import os
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
@@ -31,6 +33,53 @@ def _use_codec_right_padded_decode() -> bool:
     """Return whether the opt-in right-padded codec path is active."""
 
     return os.environ.get("QTB_FASTER_CODEC_RIGHT_PADDED_DECODE") == "1"
+
+
+def _use_async_codec_decode() -> bool:
+    """Return whether the diagnostic codec/generation overlap probe is active."""
+
+    return os.environ.get("QTB_FASTER_ASYNC_CODEC_DECODE") == "1"
+
+
+def _prefetch_codec_chunks(source, *, device: torch.device):
+    """Run AR generation in a producer thread while the caller decodes audio.
+
+    ``fast_generate_streaming`` synchronizes each emitted codec chunk before
+    yielding it, so the consumer can safely submit codec work on a separate
+    CUDA stream. The bounded queue limits extra GPU memory and preserves chunk
+    order. This is an opt-in diagnostic path; the default remains synchronous.
+    """
+
+    items: queue.Queue = queue.Queue(maxsize=2)
+    done = object()
+
+    def produce() -> None:
+        try:
+            with torch.cuda.device(device):
+                for item in source:
+                    items.put(("item", item))
+        except Exception as error:  # noqa: BLE001 - propagate worker failures
+            items.put(("error", error))
+        finally:
+            items.put(("done", done))
+
+    producer = threading.Thread(
+        target=produce,
+        name="faster-qwen-codec-prefetch",
+        daemon=True,
+    )
+    producer.start()
+    try:
+        while True:
+            kind, value = items.get()
+            if kind == "item":
+                yield value
+            elif kind == "error":
+                raise value
+            else:
+                return
+    finally:
+        producer.join()
 
 
 def _use_decode_backbone_compile() -> bool:
@@ -2187,7 +2236,7 @@ class FasterQwen3TTS:
         termination_trace: dict = {}
         previous_tail: Optional[np.ndarray] = None
 
-        for codec_chunk, timing in fast_generate_streaming(
+        codec_source = fast_generate_streaming(
             talker=talker,
             talker_input_embeds=tie,
             attention_mask=tam,
@@ -2218,7 +2267,16 @@ class FasterQwen3TTS:
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
             prefill_require_precompiled=self.prefill_require_precompiled,
             cancel_check=cancel_check,
-        ):
+        )
+        async_codec_stream = None
+        if _use_async_codec_decode() and _use_codec_right_padded_decode():
+            codec_source = _prefetch_codec_chunks(
+                codec_source,
+                device=talker.device,
+            )
+            async_codec_stream = torch.cuda.Stream(device=talker.device)
+
+        for codec_chunk, timing in codec_source:
             wrapper_started = time.perf_counter()
             context_started = time.perf_counter()
             all_codes.append(codec_chunk)
@@ -2249,11 +2307,23 @@ class FasterQwen3TTS:
                 codec_start_event.record()
             codec_decode_started = time.perf_counter()
             if _use_codec_right_padded_decode():
-                audio_list, sr = _decode_right_padded_window(
-                    speech_tokenizer,
-                    decode_input.to(talker.device),
-                    _codec_right_padded_decode_window_frames(),
-                )
+                if async_codec_stream is None:
+                    audio_list, sr = _decode_right_padded_window(
+                        speech_tokenizer,
+                        decode_input.to(talker.device),
+                        _codec_right_padded_decode_window_frames(),
+                    )
+                else:
+                    with torch.cuda.stream(async_codec_stream):
+                        audio_list, sr = _decode_right_padded_window(
+                            speech_tokenizer,
+                            decode_input.to(talker.device),
+                            _codec_right_padded_decode_window_frames(),
+                        )
+                    # The helper performs the device-to-host copy on the codec
+                    # stream. Synchronize only that stream so the producer's
+                    # default-stream AR work remains overlapped.
+                    async_codec_stream.synchronize()
             else:
                 audio_list, sr = speech_tokenizer.decode(
                     {"audio_codes": decode_input.unsqueeze(0)}
