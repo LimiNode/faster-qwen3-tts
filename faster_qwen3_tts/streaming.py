@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from .generate import get_eos_tracker, get_fused_codec_embeddings
+from .first_chunk_profiler import create_first_chunk_profiler
 from .prefill_compat import (
     ensure_prefill_compile_compat,
     normalize_prefill_compile_compat_mode,
@@ -1268,6 +1269,9 @@ def fast_generate_streaming(
         "emitted_steps": 0,
     }
     chunk_start = time.time()
+    first_chunk_profiler = create_first_chunk_profiler(device)
+    if first_chunk_profiler is not None:
+        first_chunk_profiler.start()
 
     for step_idx in range(max_new_tokens):
         if cancel_check is not None and cancel_check():
@@ -1433,6 +1437,9 @@ def fast_generate_streaming(
             total_steps += len(chunk_buffer)
             is_final_chunk = eos_found or step_idx + 1 >= max_new_tokens
             if chunk_count == 0:
+                if first_chunk_profiler is not None:
+                    prefill_profile.update(first_chunk_profiler.stop())
+                    first_chunk_profiler = None
                 prefill_profile.update(decode_phase_timer.metrics())
                 prefill_profile["ar_frame_timings"] = decode_phase_timer.frame_metrics()
                 prefill_profile["predictor_output_mode"] = (
