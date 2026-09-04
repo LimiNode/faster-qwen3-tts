@@ -52,16 +52,27 @@ def _prefetch_codec_chunks(source, *, device: torch.device):
 
     items: queue.Queue = queue.Queue(maxsize=2)
     done = object()
+    stop_requested = threading.Event()
+
+    def put(kind: str, value: Any) -> bool:
+        while not stop_requested.is_set():
+            try:
+                items.put((kind, value), timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def produce() -> None:
         try:
             with torch.cuda.device(device):
                 for item in source:
-                    items.put(("item", item))
+                    if not put("item", item):
+                        return
         except Exception as error:  # noqa: BLE001 - propagate worker failures
-            items.put(("error", error))
+            put("error", error)
         finally:
-            items.put(("done", done))
+            put("done", done)
 
     producer = threading.Thread(
         target=produce,
@@ -79,7 +90,15 @@ def _prefetch_codec_chunks(source, *, device: torch.device):
             else:
                 return
     finally:
-        producer.join()
+        stop_requested.set()
+        producer.join(timeout=5.0)
+        if producer.is_alive():
+            logger.warning("codec prefetch producer did not stop within 5 seconds")
+
+
+def _decoder_async_codec_stream(speech_tokenizer: Any) -> Optional[torch.cuda.Stream]:
+    decoder = getattr(getattr(speech_tokenizer, "model", None), "decoder", None)
+    return getattr(decoder, "_qtb_async_codec_stream", None)
 
 
 def _use_decode_backbone_compile() -> bool:
@@ -257,7 +276,21 @@ def _capture_right_padded_decoder_cuda_graph(base_model: Any) -> None:
         "Capturing fixed-shape right-padded codec CUDA graph (window=%s)",
         window_size,
     )
-    capture_cuda_graph(window_size=window_size)
+    if not _use_async_codec_decode():
+        capture_cuda_graph(window_size=window_size)
+        return
+
+    try:
+        device = next(decoder.parameters()).device
+    except (AttributeError, StopIteration) as exc:
+        raise RuntimeError(
+            "async codec graph capture requires decoder device metadata"
+        ) from exc
+    codec_stream = torch.cuda.Stream(device=device)
+    setattr(decoder, "_qtb_async_codec_stream", codec_stream)
+    with torch.cuda.stream(codec_stream):
+        capture_cuda_graph(window_size=window_size)
+    torch.cuda.current_stream(device=device).wait_stream(codec_stream)
 
 
 def _decode_right_padded_window(
@@ -2274,7 +2307,11 @@ class FasterQwen3TTS:
                 codec_source,
                 device=talker.device,
             )
-            async_codec_stream = torch.cuda.Stream(device=talker.device)
+            async_codec_stream = _decoder_async_codec_stream(speech_tokenizer)
+            if async_codec_stream is None:
+                raise RuntimeError(
+                    "async codec decode requires capture on its dedicated CUDA stream"
+                )
 
         for codec_chunk, timing in codec_source:
             wrapper_started = time.perf_counter()
@@ -2314,6 +2351,7 @@ class FasterQwen3TTS:
                         _codec_right_padded_decode_window_frames(),
                     )
                 else:
+                    async_codec_stream.wait_stream(torch.cuda.current_stream(talker.device))
                     with torch.cuda.stream(async_codec_stream):
                         audio_list, sr = _decode_right_padded_window(
                             speech_tokenizer,
