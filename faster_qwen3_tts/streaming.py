@@ -58,6 +58,7 @@ _PREFILL_COMPILE_ERRORS = OrderedDict()
 _PREFILL_COMPILE_CALL_COUNTS = {}
 _PREFILL_COMPILE_EVICTIONS = 0
 _PREFILL_COMPILE_CACHE_LOCK = threading.RLock()
+_VOICE_PREFIX_KV_CACHE_MAX_ENTRIES = 8
 
 
 class UnsupportedPrefillConfiguration(ValueError):
@@ -92,6 +93,147 @@ def _prefix_split_probe_result() -> dict[str, Any]:
         "prefix_split_probe_seeded_kv_allclose": None,
         "prefix_split_probe_first_token_match": None,
     }
+
+
+def _voice_prefix_reuse_profile() -> dict[str, Any]:
+    """Return stable telemetry for the opt-in perceptual-risk prefill path."""
+
+    return {
+        "voice_prefix_kv_reuse_enabled": False,
+        "voice_prefix_kv_reuse_hit": False,
+        "voice_prefix_kv_reuse_prefix_length": 0,
+        "voice_prefix_kv_reuse_cache_entries": 0,
+        "voice_prefix_kv_reuse_prefix_mismatch": False,
+    }
+
+
+def _voice_prefix_cache_for(talker) -> OrderedDict:
+    cache = getattr(talker, "_qtb_voice_prefix_kv_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        setattr(talker, "_qtb_voice_prefix_kv_cache", cache)
+    return cache
+
+
+def _cache_data(past_key_values, prefix_length: int) -> list[tuple[Any, Any]]:
+    layers = getattr(past_key_values, "layers", None)
+    if layers is None:
+        raise RuntimeError("voice prefix reuse requires a layered dynamic cache")
+    data = []
+    for layer in layers:
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        if keys is None or values is None:
+            raise RuntimeError("voice prefix cache tensors are unavailable")
+        data.append(
+            (
+                keys[..., :prefix_length, :].clone(),
+                values[..., :prefix_length, :].clone(),
+            )
+        )
+    return data
+
+
+def _new_cache(cache_type: type, cache_data: list[tuple[Any, Any]]):
+    try:
+        return cache_type(ddp_cache_data=cache_data)
+    except TypeError:
+        return cache_type(cache_data)
+
+
+def _run_voice_prefix_reuse(
+    talker,
+    talker_input_embeds: torch.Tensor,
+    trailing_text_hiddens: torch.Tensor,
+    tts_pad_embed: torch.Tensor,
+    *,
+    cache_key: str,
+    prefix_length: int,
+    input_metadata: Optional[dict],
+):
+    """Run suffix prefill from per-voice KV with explicit perceptual risk."""
+
+    total_length = int(talker_input_embeds.shape[1])
+    if not cache_key:
+        raise ValueError("voice prefix reuse requires a non-empty cache key")
+    if prefix_length <= 0 or prefix_length >= total_length:
+        raise ValueError("voice prefix reuse length must be inside the prefill")
+    if not isinstance(input_metadata, dict):
+        raise ValueError("voice prefix reuse requires validated input metadata")
+    if input_metadata.get("prefill_attention_mask_all_valid") is not True:
+        raise ValueError("voice prefix reuse requires an all-valid attention mask")
+    if input_metadata.get("prefill_batch_size") != 1:
+        raise ValueError("voice prefix reuse requires batch size one")
+    if input_metadata.get("prefill_has_sliding_window") is True:
+        raise ValueError("voice prefix reuse does not support sliding-window attention")
+
+    inner = getattr(talker, "model", None)
+    if inner is None:
+        raise RuntimeError("talker.model is unavailable")
+    prefix = talker_input_embeds[:, :prefix_length]
+    cache = _voice_prefix_cache_for(talker)
+    scoped_key = (
+        str(cache_key),
+        int(prefix_length),
+        str(talker_input_embeds.device),
+        str(talker_input_embeds.dtype),
+    )
+    entry = cache.pop(scoped_key, None)
+    prefix_mismatch = False
+    if entry is not None and not torch.equal(entry["prefix"], prefix):
+        entry = None
+        prefix_mismatch = True
+
+    cache_hit = entry is not None
+    if entry is None:
+        prefix_out = inner(
+            inputs_embeds=prefix,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            use_cache=True,
+            output_hidden_states=False,
+            cache_position=None,
+            skip_prefill_causal_mask=True,
+        )
+        entry = {
+            "prefix": prefix.clone(),
+            "cache_type": type(prefix_out.past_key_values),
+            "cache_data": _cache_data(prefix_out.past_key_values, prefix_length),
+        }
+    cache[scoped_key] = entry
+    while len(cache) > _VOICE_PREFIX_KV_CACHE_MAX_ENTRIES:
+        cache.popitem(last=False)
+
+    seeded_cache = _new_cache(entry["cache_type"], entry["cache_data"])
+    out = talker.forward(
+        inputs_embeds=talker_input_embeds[:, prefix_length:],
+        attention_mask=None,
+        use_cache=True,
+        output_hidden_states=not _drop_prefill_hidden_states(),
+        return_dict=True,
+        trailing_text_hidden=trailing_text_hiddens,
+        tts_pad_embed=tts_pad_embed,
+        generation_step=None,
+        past_hidden=None,
+        past_key_values=seeded_cache,
+        skip_prefill_causal_mask=False,
+    )
+    profile = _voice_prefix_reuse_profile()
+    profile.update(
+        {
+            "voice_prefix_kv_reuse_enabled": True,
+            "voice_prefix_kv_reuse_hit": cache_hit,
+            "voice_prefix_kv_reuse_prefix_length": int(prefix_length),
+            "voice_prefix_kv_reuse_cache_entries": len(cache),
+            "voice_prefix_kv_reuse_prefix_mismatch": prefix_mismatch,
+            "prefill_backend_requested": "voice_prefix_kv_reuse",
+            "prefill_backend_used": "voice_prefix_kv_reuse",
+            "prefill_shape_policy": "voice_prefix_kv_reuse",
+            "prefill_shape_length": total_length,
+        }
+    )
+    return out, profile
 
 
 class _CudaNvtxRange:
@@ -1204,6 +1346,9 @@ def fast_generate_streaming(
     prefill_require_precompiled: bool = False,
     prefix_split_probe_enabled: bool = False,
     prefix_split_probe_prefix_length: int = 86,
+    voice_prefix_kv_reuse_enabled: bool = False,
+    voice_prefix_kv_cache_key: Optional[str] = None,
+    voice_prefix_kv_reuse_prefix_length: int = 86,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
@@ -1250,6 +1395,7 @@ def fast_generate_streaming(
     t_start = time.perf_counter()
     prefill_profile = {}
     prefill_profile.update(_prefix_split_probe_result())
+    prefill_profile.update(_voice_prefix_reuse_profile())
     prefill_profile["prefix_split_probe_enabled"] = bool(prefix_split_probe_enabled)
     prefill_events = _PrefillEvents(device, profile_prefill)
     nvtx_enabled = profile_nvtx and device.type == "cuda"
@@ -1263,21 +1409,34 @@ def fast_generate_streaming(
 
     forward_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_talker_forward", nvtx_enabled):
-        out, backend_profile = _run_talker_prefill(
-            talker,
-            talker_input_embeds,
-            attention_mask,
-            trailing_text_hiddens,
-            tts_pad_embed,
-            prefill_backend=prefill_backend,
-            prefill_mask_mode=prefill_mask_mode,
-            prefill_compile_compat_mode=prefill_compile_compat_mode,
-            prefill_compile_lengths=compile_lengths,
-            prefill_compile_on_miss=prefill_compile_on_miss,
-            prefill_unknown_shape_policy=unknown_shape_policy,
-            prefill_require_precompiled=prefill_require_precompiled,
-            input_metadata=input_metadata,
-        )
+        if voice_prefix_kv_reuse_enabled:
+            if prefill_backend != "eager":
+                raise ValueError("voice prefix reuse requires eager prefill")
+            out, backend_profile = _run_voice_prefix_reuse(
+                talker,
+                talker_input_embeds,
+                trailing_text_hiddens,
+                tts_pad_embed,
+                cache_key=str(voice_prefix_kv_cache_key or ""),
+                prefix_length=int(voice_prefix_kv_reuse_prefix_length),
+                input_metadata=input_metadata,
+            )
+        else:
+            out, backend_profile = _run_talker_prefill(
+                talker,
+                talker_input_embeds,
+                attention_mask,
+                trailing_text_hiddens,
+                tts_pad_embed,
+                prefill_backend=prefill_backend,
+                prefill_mask_mode=prefill_mask_mode,
+                prefill_compile_compat_mode=prefill_compile_compat_mode,
+                prefill_compile_lengths=compile_lengths,
+                prefill_compile_on_miss=prefill_compile_on_miss,
+                prefill_unknown_shape_policy=unknown_shape_policy,
+                prefill_require_precompiled=prefill_require_precompiled,
+                input_metadata=input_metadata,
+            )
     prefill_profile["talker_forward_launch_wall_ms"] = (
         time.perf_counter() - forward_started
     ) * 1000

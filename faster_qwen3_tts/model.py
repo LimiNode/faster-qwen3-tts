@@ -1797,6 +1797,9 @@ class FasterQwen3TTS:
         profile_request_role: Optional[str] = None,
         prefill_backend: Optional[str] = None,
         prefill_compile_compat_mode: Optional[str] = None,
+        voice_prefix_kv_reuse_enabled: bool = False,
+        voice_prefix_kv_cache_key: Optional[str] = None,
+        voice_prefix_kv_reuse_prefix_length: int = 86,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         """
@@ -1971,6 +1974,11 @@ class FasterQwen3TTS:
                     "prefill_require_precompiled": self.prefill_require_precompiled,
                     "prefix_split_probe_enabled": prefix_split_probe_enabled,
                     "prefix_split_probe_prefix_length": prefix_split_probe_prefix_length,
+                    "voice_prefix_kv_reuse_enabled": voice_prefix_kv_reuse_enabled,
+                    "voice_prefix_kv_cache_key": voice_prefix_kv_cache_key,
+                    "voice_prefix_kv_reuse_prefix_length": (
+                        voice_prefix_kv_reuse_prefix_length
+                    ),
                     "cancel_check": cancel_check,
                 }
             )

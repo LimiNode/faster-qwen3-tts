@@ -640,6 +640,198 @@ def _dummy_streaming_model():
     return DummyTalker()
 
 
+class _VoicePrefixLayer:
+    def __init__(self, keys, values):
+        self.keys = keys
+        self.values = values
+
+
+class _VoicePrefixCache:
+    def __init__(self, ddp_cache_data):
+        self.layers = [
+            _VoicePrefixLayer(keys, values) for keys, values in ddp_cache_data
+        ]
+
+
+class _VoicePrefixTalker:
+    def __init__(self):
+        self.model = self
+        self.prefix_calls = 0
+        self.suffix_calls = 0
+
+    def __call__(self, *, inputs_embeds, past_key_values, **_kwargs):
+        assert past_key_values is None
+        self.prefix_calls += 1
+        keys = inputs_embeds.unsqueeze(1)
+        values = (inputs_embeds + 100).unsqueeze(1)
+        return types.SimpleNamespace(
+            past_key_values=_VoicePrefixCache([(keys, values)])
+        )
+
+    def forward(self, *, inputs_embeds, past_key_values, **_kwargs):
+        self.suffix_calls += 1
+        assert isinstance(past_key_values, _VoicePrefixCache)
+        layer = past_key_values.layers[0]
+        layer.keys = torch.cat((layer.keys, inputs_embeds.unsqueeze(1)), dim=-2)
+        layer.values = torch.cat(
+            (layer.values, (inputs_embeds + 100).unsqueeze(1)), dim=-2
+        )
+        return types.SimpleNamespace(
+            past_key_values=past_key_values,
+            past_hidden=inputs_embeds[:, -1:],
+            generation_step=0,
+            logits=inputs_embeds,
+        )
+
+
+def _voice_prefix_inputs(prefix_value=1.0):
+    embeds = torch.arange(24, dtype=torch.float32).reshape(1, 6, 4)
+    embeds[:, :3] = prefix_value
+    return embeds
+
+
+def test_voice_prefix_reuse_hits_without_mutating_the_cached_prefix():
+    talker = _VoicePrefixTalker()
+    inputs = _voice_prefix_inputs()
+
+    _out, miss = streaming._run_voice_prefix_reuse(
+        talker,
+        inputs,
+        torch.zeros(1, 1, 4),
+        torch.zeros(1, 1, 4),
+        cache_key="voice-a",
+        prefix_length=3,
+        input_metadata=_verified_prefill_metadata(),
+    )
+    _out, hit = streaming._run_voice_prefix_reuse(
+        talker,
+        inputs,
+        torch.zeros(1, 1, 4),
+        torch.zeros(1, 1, 4),
+        cache_key="voice-a",
+        prefix_length=3,
+        input_metadata=_verified_prefill_metadata(),
+    )
+
+    assert talker.prefix_calls == 1
+    assert talker.suffix_calls == 2
+    assert miss["voice_prefix_kv_reuse_hit"] is False
+    assert hit["voice_prefix_kv_reuse_hit"] is True
+    cached = next(iter(talker._qtb_voice_prefix_kv_cache.values()))
+    assert cached["cache_data"][0][0].shape[-2] == 3
+
+
+def test_voice_prefix_reuse_keeps_a_b_a_voice_entries_isolated():
+    talker = _VoicePrefixTalker()
+
+    profiles = []
+    for key, prefix_value in (("voice-a", 1.0), ("voice-b", 2.0), ("voice-a", 1.0)):
+        _out, profile = streaming._run_voice_prefix_reuse(
+            talker,
+            _voice_prefix_inputs(prefix_value),
+            torch.zeros(1, 1, 4),
+            torch.zeros(1, 1, 4),
+            cache_key=key,
+            prefix_length=3,
+            input_metadata=_verified_prefill_metadata(),
+        )
+        profiles.append(profile)
+
+    assert talker.prefix_calls == 2
+    assert [profile["voice_prefix_kv_reuse_hit"] for profile in profiles] == [
+        False,
+        False,
+        True,
+    ]
+    assert profiles[-1]["voice_prefix_kv_reuse_cache_entries"] == 2
+
+
+def test_voice_prefix_reuse_rebuilds_when_registered_voice_prefix_changes():
+    talker = _VoicePrefixTalker()
+
+    streaming._run_voice_prefix_reuse(
+        talker,
+        _voice_prefix_inputs(1.0),
+        torch.zeros(1, 1, 4),
+        torch.zeros(1, 1, 4),
+        cache_key="voice-a",
+        prefix_length=3,
+        input_metadata=_verified_prefill_metadata(),
+    )
+    _out, profile = streaming._run_voice_prefix_reuse(
+        talker,
+        _voice_prefix_inputs(3.0),
+        torch.zeros(1, 1, 4),
+        torch.zeros(1, 1, 4),
+        cache_key="voice-a",
+        prefix_length=3,
+        input_metadata=_verified_prefill_metadata(),
+    )
+
+    assert talker.prefix_calls == 2
+    assert profile["voice_prefix_kv_reuse_hit"] is False
+    assert profile["voice_prefix_kv_reuse_prefix_mismatch"] is True
+
+
+@pytest.mark.parametrize(
+    "cache_key,prefix_length,metadata,match",
+    [
+        ("", 3, _verified_prefill_metadata(), "non-empty cache key"),
+        ("voice-a", 0, _verified_prefill_metadata(), "inside the prefill"),
+        ("voice-a", 6, _verified_prefill_metadata(), "inside the prefill"),
+        ("voice-a", 3, None, "validated input metadata"),
+        ("voice-a", 3, {}, "all-valid attention mask"),
+        (
+            "voice-a",
+            3,
+            {**_verified_prefill_metadata(), "prefill_batch_size": 2},
+            "batch size one",
+        ),
+        (
+            "voice-a",
+            3,
+            {**_verified_prefill_metadata(), "prefill_has_sliding_window": True},
+            "sliding-window",
+        ),
+    ],
+)
+def test_voice_prefix_reuse_rejects_unsafe_configuration(
+    cache_key,
+    prefix_length,
+    metadata,
+    match,
+):
+    with pytest.raises(ValueError, match=match):
+        streaming._run_voice_prefix_reuse(
+            _VoicePrefixTalker(),
+            _voice_prefix_inputs(),
+            torch.zeros(1, 1, 4),
+            torch.zeros(1, 1, 4),
+            cache_key=cache_key,
+            prefix_length=prefix_length,
+            input_metadata=metadata,
+        )
+
+
+def test_voice_prefix_cache_is_bounded_and_lru():
+    talker = _VoicePrefixTalker()
+
+    for index in range(streaming._VOICE_PREFIX_KV_CACHE_MAX_ENTRIES + 1):
+        streaming._run_voice_prefix_reuse(
+            talker,
+            _voice_prefix_inputs(float(index)),
+            torch.zeros(1, 1, 4),
+            torch.zeros(1, 1, 4),
+            cache_key=f"voice-{index}",
+            prefix_length=3,
+            input_metadata=_verified_prefill_metadata(),
+        )
+
+    cache = talker._qtb_voice_prefix_kv_cache
+    assert len(cache) == streaming._VOICE_PREFIX_KV_CACHE_MAX_ENTRIES
+    assert all(key[0] != "voice-0" for key in cache)
+
+
 def test_fast_generate_streaming_auto_unknown_metadata_rejects_compiled_prefill():
     talker = _dummy_streaming_model()
     tie, tam, tth, tpe = _dummy_prefill_inputs()
