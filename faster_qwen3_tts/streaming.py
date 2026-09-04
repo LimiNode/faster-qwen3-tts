@@ -75,10 +75,21 @@ def _prefix_split_probe_result() -> dict[str, Any]:
         "prefix_split_probe_error": None,
         "prefix_split_probe_hidden_max_abs_delta": None,
         "prefix_split_probe_hidden_mean_abs_delta": None,
+        "prefix_split_probe_prefix_hidden_max_abs_delta": None,
+        "prefix_split_probe_prefix_hidden_mean_abs_delta": None,
         "prefix_split_probe_logits_max_abs_delta": None,
         "prefix_split_probe_logits_allclose": None,
         "prefix_split_probe_kv_max_abs_delta": None,
         "prefix_split_probe_kv_allclose": None,
+        "prefix_split_probe_prefix_kv_max_abs_delta": None,
+        "prefix_split_probe_prefix_kv_allclose": None,
+        "prefix_split_probe_seeded_hidden_max_abs_delta": None,
+        "prefix_split_probe_seeded_hidden_mean_abs_delta": None,
+        "prefix_split_probe_seeded_logits_max_abs_delta": None,
+        "prefix_split_probe_seeded_logits_allclose": None,
+        "prefix_split_probe_seeded_first_token_match": None,
+        "prefix_split_probe_seeded_kv_max_abs_delta": None,
+        "prefix_split_probe_seeded_kv_allclose": None,
         "prefix_split_probe_first_token_match": None,
     }
 
@@ -937,31 +948,21 @@ def _run_prefix_split_probe(
         inner = getattr(talker, "model", None)
         if inner is None:
             raise RuntimeError("talker.model is unavailable")
-        cache_type = type(full_out.past_key_values)
-        split_cache = cache_type()
-        device = talker_input_embeds.device
-        full_attention = torch.ones(
-            (1, total_length), dtype=torch.long, device=device
-        )
-        positions = torch.arange(total_length, device=device, dtype=torch.long)
-        position_ids = positions.view(1, 1, -1).expand(3, 1, -1)
+        # Match the accepted full-prefill path exactly for the reusable prefix.
+        # An explicit all-ones mask is mathematically equivalent, but it selects
+        # a different SDPA path and produced materially different FP16 KV values
+        # on CMP 50HX.  The suffix cannot use the prefill-only mask shortcut
+        # because it starts with a populated cache, so let the model construct
+        # the causal mask and positions from that cache.
         prefix_out = inner(
             inputs_embeds=talker_input_embeds[:, :prefix_length],
-            attention_mask=full_attention[:, :prefix_length],
-            position_ids=position_ids[:, :, :prefix_length],
-            past_key_values=split_cache,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
             use_cache=True,
             output_hidden_states=True,
-            cache_position=positions[:prefix_length],
-        )
-        suffix_out = inner(
-            inputs_embeds=talker_input_embeds[:, prefix_length:],
-            attention_mask=full_attention,
-            position_ids=position_ids[:, :, prefix_length:],
-            past_key_values=prefix_out.past_key_values,
-            use_cache=True,
-            output_hidden_states=True,
-            cache_position=positions[prefix_length:],
+            cache_position=None,
+            skip_prefill_causal_mask=True,
         )
 
         full_hidden = getattr(full_out, "last_hidden_state", None)
@@ -971,15 +972,108 @@ def _run_prefix_split_probe(
                 full_hidden = hidden_states[0][-1]
             elif hidden_states:
                 full_hidden = hidden_states[-1]
+        if full_hidden is None or prefix_out.last_hidden_state is None:
+            raise RuntimeError("hidden state output is unavailable")
+
+        prefix_hidden_delta = (
+            prefix_out.last_hidden_state.float()
+            - full_hidden[:, :prefix_length].float()
+        ).abs()
+        result["prefix_split_probe_prefix_hidden_max_abs_delta"] = float(
+            prefix_hidden_delta.max().item()
+        )
+        result["prefix_split_probe_prefix_hidden_mean_abs_delta"] = float(
+            prefix_hidden_delta.mean().item()
+        )
+
+        full_cache = full_out.past_key_values
+        prefix_cache = prefix_out.past_key_values
+        layers = getattr(full_cache, "layers", None)
+        prefix_layers = getattr(prefix_cache, "layers", None)
+        if layers is None or prefix_layers is None or len(layers) != len(prefix_layers):
+            raise RuntimeError("unsupported cache representation")
+
+        prefix_kv_max = 0.0
+        prefix_kv_allclose = True
+        seeded_cache_data = []
+        for full_layer, prefix_layer in zip(layers, prefix_layers):
+            full_keys = getattr(full_layer, "keys", None)
+            full_values = getattr(full_layer, "values", None)
+            prefix_keys = getattr(prefix_layer, "keys", None)
+            prefix_values = getattr(prefix_layer, "values", None)
+            if any(
+                tensor is None
+                for tensor in (full_keys, full_values, prefix_keys, prefix_values)
+            ):
+                raise RuntimeError("cache layer tensors are unavailable")
+            for full_tensor, prefix_tensor in (
+                (full_keys, prefix_keys),
+                (full_values, prefix_values),
+            ):
+                delta = (
+                    prefix_tensor.float()
+                    - full_tensor[..., :prefix_length, :].float()
+                ).abs()
+                prefix_kv_max = max(prefix_kv_max, float(delta.max().item()))
+                prefix_kv_allclose = prefix_kv_allclose and bool(
+                    torch.allclose(
+                        prefix_tensor,
+                        full_tensor[..., :prefix_length, :],
+                        rtol=5e-2,
+                        atol=5e-2,
+                    )
+                )
+            seeded_cache_data.append(
+                (
+                    full_keys[..., :prefix_length, :].clone(),
+                    full_values[..., :prefix_length, :].clone(),
+                )
+            )
+        result["prefix_split_probe_prefix_kv_max_abs_delta"] = prefix_kv_max
+        result["prefix_split_probe_prefix_kv_allclose"] = prefix_kv_allclose
+
+        cache_type = type(full_cache)
+        try:
+            seeded_cache = cache_type(ddp_cache_data=seeded_cache_data)
+        except TypeError:
+            seeded_cache = cache_type(seeded_cache_data)
+        seeded_suffix_out = inner(
+            inputs_embeds=talker_input_embeds[:, prefix_length:],
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=seeded_cache,
+            use_cache=True,
+            output_hidden_states=True,
+            cache_position=None,
+        )
+        suffix_out = inner(
+            inputs_embeds=talker_input_embeds[:, prefix_length:],
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=prefix_out.past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            cache_position=None,
+        )
+
         split_hidden = suffix_out.last_hidden_state
-        if full_hidden is None or split_hidden is None:
+        seeded_hidden = seeded_suffix_out.last_hidden_state
+        if split_hidden is None or seeded_hidden is None:
             raise RuntimeError("hidden state output is unavailable")
         full_suffix = full_hidden[:, prefix_length:]
         hidden_delta = (split_hidden.float() - full_suffix.float()).abs()
         result["prefix_split_probe_hidden_max_abs_delta"] = float(hidden_delta.max().item())
         result["prefix_split_probe_hidden_mean_abs_delta"] = float(hidden_delta.mean().item())
+        seeded_hidden_delta = (seeded_hidden.float() - full_suffix.float()).abs()
+        result["prefix_split_probe_seeded_hidden_max_abs_delta"] = float(
+            seeded_hidden_delta.max().item()
+        )
+        result["prefix_split_probe_seeded_hidden_mean_abs_delta"] = float(
+            seeded_hidden_delta.mean().item()
+        )
 
         split_logits = talker.codec_head(split_hidden)
+        seeded_logits = talker.codec_head(seeded_hidden)
         full_logits = getattr(full_out, "logits", None)
         if full_logits is not None:
             logits_delta = (split_logits.float() - full_logits[:, prefix_length:].float()).abs()
@@ -991,28 +1085,76 @@ def _run_prefix_split_probe(
                 torch.argmax(split_logits[:, 0], dim=-1).item()
                 == torch.argmax(full_logits[:, prefix_length], dim=-1).item()
             )
+            seeded_logits_delta = (
+                seeded_logits.float() - full_logits[:, prefix_length:].float()
+            ).abs()
+            result["prefix_split_probe_seeded_logits_max_abs_delta"] = float(
+                seeded_logits_delta.max().item()
+            )
+            result["prefix_split_probe_seeded_logits_allclose"] = bool(
+                torch.allclose(
+                    seeded_logits,
+                    full_logits[:, prefix_length:],
+                    rtol=5e-2,
+                    atol=5e-2,
+                )
+            )
+            result["prefix_split_probe_seeded_first_token_match"] = bool(
+                torch.argmax(seeded_logits[:, 0], dim=-1).item()
+                == torch.argmax(full_logits[:, prefix_length], dim=-1).item()
+            )
 
-        full_cache = full_out.past_key_values
         split_cache = suffix_out.past_key_values
+        seeded_split_cache = seeded_suffix_out.past_key_values
         kv_max = 0.0
         kv_allclose = True
-        layers = getattr(full_cache, "layers", None)
+        seeded_kv_max = 0.0
+        seeded_kv_allclose = True
         split_layers = getattr(split_cache, "layers", None)
-        if layers is None or split_layers is None or len(layers) != len(split_layers):
+        seeded_split_layers = getattr(seeded_split_cache, "layers", None)
+        if (
+            split_layers is None
+            or seeded_split_layers is None
+            or len(layers) != len(split_layers)
+            or len(layers) != len(seeded_split_layers)
+        ):
             raise RuntimeError("unsupported cache representation")
-        for full_layer, split_layer in zip(layers, split_layers):
+        for full_layer, split_layer, seeded_split_layer in zip(
+            layers, split_layers, seeded_split_layers
+        ):
             for name in ("keys", "values"):
                 full_tensor = getattr(full_layer, name, None)
                 split_tensor = getattr(split_layer, name, None)
-                if full_tensor is None or split_tensor is None:
+                seeded_split_tensor = getattr(seeded_split_layer, name, None)
+                if (
+                    full_tensor is None
+                    or split_tensor is None
+                    or seeded_split_tensor is None
+                ):
                     raise RuntimeError("cache layer tensors are unavailable")
                 delta = (split_tensor.float() - full_tensor.float()).abs()
                 kv_max = max(kv_max, float(delta.max().item()))
                 kv_allclose = kv_allclose and bool(
                     torch.allclose(split_tensor, full_tensor, rtol=5e-2, atol=5e-2)
                 )
+                seeded_delta = (
+                    seeded_split_tensor.float() - full_tensor.float()
+                ).abs()
+                seeded_kv_max = max(
+                    seeded_kv_max, float(seeded_delta.max().item())
+                )
+                seeded_kv_allclose = seeded_kv_allclose and bool(
+                    torch.allclose(
+                        seeded_split_tensor,
+                        full_tensor,
+                        rtol=5e-2,
+                        atol=5e-2,
+                    )
+                )
         result["prefix_split_probe_kv_max_abs_delta"] = kv_max
         result["prefix_split_probe_kv_allclose"] = kv_allclose
+        result["prefix_split_probe_seeded_kv_max_abs_delta"] = seeded_kv_max
+        result["prefix_split_probe_seeded_kv_allclose"] = seeded_kv_allclose
         result["prefix_split_probe_supported"] = True
     except Exception as exc:  # diagnostic probes must never break synthesis
         result["prefix_split_probe_error"] = f"{type(exc).__name__}: {exc}"

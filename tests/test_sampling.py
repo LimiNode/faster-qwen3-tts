@@ -27,6 +27,9 @@ def test_prefix_split_probe_rejects_unsafe_profile_without_running_model():
     assert result["prefix_split_probe_attempted"] is False
     assert result["prefix_split_probe_supported"] is False
     assert result["prefix_split_probe_error"] == "requires_all_valid_non_sliding_profile"
+    assert result["prefix_split_probe_prefix_kv_allclose"] is None
+    assert result["prefix_split_probe_seeded_first_token_match"] is None
+    assert result["prefix_split_probe_seeded_kv_allclose"] is None
 
 
 def test_repetition_penalty_uses_all_history():
