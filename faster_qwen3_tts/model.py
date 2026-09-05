@@ -8,6 +8,8 @@ CUDA graphs for 6-10x speedup.
 import hashlib
 import logging
 import os
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
@@ -31,6 +33,134 @@ def _use_codec_right_padded_decode() -> bool:
     """Return whether the opt-in right-padded codec path is active."""
 
     return os.environ.get("QTB_FASTER_CODEC_RIGHT_PADDED_DECODE") == "1"
+
+
+def _use_async_codec_decode() -> bool:
+    """Return whether the diagnostic codec/generation overlap probe is active."""
+
+    return os.environ.get("QTB_FASTER_ASYNC_CODEC_DECODE") == "1"
+
+
+def _prefetch_codec_chunks(source, *, device: torch.device):
+    """Run AR generation in a producer thread while the caller decodes audio.
+
+    ``fast_generate_streaming`` synchronizes each emitted codec chunk before
+    yielding it, so the consumer can safely submit codec work on a separate
+    CUDA stream. The bounded queue limits extra GPU memory and preserves chunk
+    order. This is an opt-in diagnostic path; the default remains synchronous.
+    """
+
+    items: queue.Queue = queue.Queue(maxsize=2)
+    done = object()
+    stop_requested = threading.Event()
+
+    def put(kind: str, value: Any) -> bool:
+        while not stop_requested.is_set():
+            try:
+                items.put((kind, value), timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce() -> None:
+        try:
+            with torch.cuda.device(device):
+                for item in source:
+                    if not put("item", item):
+                        return
+        except Exception as error:  # noqa: BLE001 - propagate worker failures
+            put("error", error)
+        finally:
+            put("done", done)
+
+    producer = threading.Thread(
+        target=produce,
+        name="faster-qwen-codec-prefetch",
+        daemon=True,
+    )
+    producer.start()
+    try:
+        while True:
+            kind, value = items.get()
+            if kind == "item":
+                yield value
+            elif kind == "error":
+                raise value
+            else:
+                return
+    finally:
+        stop_requested.set()
+        producer.join(timeout=5.0)
+        if producer.is_alive():
+            logger.warning("codec prefetch producer did not stop within 5 seconds")
+
+
+def _decoder_async_codec_stream(speech_tokenizer: Any) -> Optional[torch.cuda.Stream]:
+    decoder = getattr(getattr(speech_tokenizer, "model", None), "decoder", None)
+    return getattr(decoder, "_qtb_async_codec_stream", None)
+
+
+def _use_decode_backbone_compile() -> bool:
+    """Return whether the diagnostic tiny-decode compile path is active."""
+
+    return os.environ.get("QTB_FASTER_COMPILE_DECODE_GRAPHS") == "1"
+
+
+def _use_talker_only_decode_compile() -> bool:
+    """Return whether only the Talker decode backbone should be compiled."""
+
+    return os.environ.get("QTB_FASTER_COMPILE_TALKER_ONLY") == "1"
+
+
+def _profile_input_hashes_enabled() -> bool:
+    """Return whether diagnostic per-position talker input hashes are enabled."""
+
+    return os.environ.get("QTB_FASTER_PROFILE_INPUT_HASHES") == "1"
+
+
+def _prefix_split_probe_config() -> tuple[bool, int]:
+    """Return opt-in split-forward probe settings from diagnostic environment."""
+
+    if os.environ.get("QTB_FASTER_PREFIX_SPLIT_PROBE") != "1":
+        return False, 86
+    raw_length = os.environ.get("QTB_FASTER_PREFIX_SPLIT_PROBE_LENGTH", "86")
+    try:
+        length = int(raw_length)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid QTB_FASTER_PREFIX_SPLIT_PROBE_LENGTH=%r", raw_length)
+        length = 86
+    return True, max(1, length)
+
+
+def _talker_input_position_hashes(talker_input_embeds: torch.Tensor) -> list[str]:
+    """Hash each talker-input position for the opt-in prefix-invariance probe."""
+
+    # Convert through float32 so this remains portable for BF16 tensors, whose
+    # NumPy representation is not available on all supported runtimes.
+    host = talker_input_embeds.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    array = host.numpy()
+    return [
+        hashlib.sha256(array[:, index : index + 1, :].tobytes()).hexdigest()
+        for index in range(array.shape[1])
+    ]
+
+
+def _compile_decode_backbone(module: torch.nn.Module, label: str) -> torch.nn.Module:
+    """Compile one fixed-shape decode backbone before CUDA Graph capture."""
+
+    logger.warning(
+        "Enabling diagnostic torch.compile for %s decode backbone; "
+        "this is not a production profile",
+        label,
+    )
+    return torch.compile(
+        module,
+        backend="inductor",
+        fullgraph=False,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
+    )
 
 
 def _codec_right_padded_decode_window_frames() -> int:
@@ -146,7 +276,21 @@ def _capture_right_padded_decoder_cuda_graph(base_model: Any) -> None:
         "Capturing fixed-shape right-padded codec CUDA graph (window=%s)",
         window_size,
     )
-    capture_cuda_graph(window_size=window_size)
+    if not _use_async_codec_decode():
+        capture_cuda_graph(window_size=window_size)
+        return
+
+    try:
+        device = next(decoder.parameters()).device
+    except (AttributeError, StopIteration) as exc:
+        raise RuntimeError(
+            "async codec graph capture requires decoder device metadata"
+        ) from exc
+    codec_stream = torch.cuda.Stream(device=device)
+    setattr(decoder, "_qtb_async_codec_stream", codec_stream)
+    with torch.cuda.stream(codec_stream):
+        capture_cuda_graph(window_size=window_size)
+    torch.cuda.current_stream(device=device).wait_stream(codec_stream)
 
 
 def _decode_right_padded_window(
@@ -648,13 +792,45 @@ class FasterQwen3TTS:
             temperature=1.0,
         )
 
+        decode_compile_enabled = _use_decode_backbone_compile()
+        talker_only_compile = _use_talker_only_decode_compile()
+        if decode_compile_enabled and not talker_only_compile:
+            predictor_graph.pred_model = _compile_decode_backbone(
+                predictor_graph.pred_model,
+                "predictor",
+            )
+            predictor_graph_greedy.pred_model = _compile_decode_backbone(
+                predictor_graph_greedy.pred_model,
+                "predictor-greedy",
+            )
+            talker_graph_model = _compile_decode_backbone(
+                talker.model,
+                "talker",
+            )
+        elif talker_only_compile:
+            logger.warning(
+                "Enabling diagnostic torch.compile for Talker only; "
+                "predictor remains eager for parity isolation",
+            )
+            talker_graph_model = _compile_decode_backbone(
+                talker.model,
+                "talker",
+            )
+        else:
+            talker_graph_model = talker.model
+        predictor_compile_active = decode_compile_enabled and not talker_only_compile
+        talker_compile_active = decode_compile_enabled or talker_only_compile
+        predictor_graph.decode_compile_enabled = predictor_compile_active
+        predictor_graph_greedy.decode_compile_enabled = predictor_compile_active
+
         talker_graph = TalkerGraph(
-            talker.model,
+            talker_graph_model,
             talker_config,
             device=device,
             dtype=dtype,
             max_seq_len=max_seq_len,
         )
+        talker_graph.decode_compile_enabled = talker_compile_active
 
         logger.info("CUDA graphs initialized (will capture on first run)")
 
@@ -969,6 +1145,7 @@ class FasterQwen3TTS:
         append_silence: bool = True,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
         instruct: Optional[str] = None,
+        return_metadata: bool = False,
     ):
         """Prepare inputs for generation (shared by streaming and non-streaming).
 
@@ -987,6 +1164,7 @@ class FasterQwen3TTS:
             instruct: Optional instruction string to guide generation style/language (e.g.
                 "请用纯正广东话朗读"). Prepended as a user turn before the assistant TTS turn.
         """
+        tokenize_started = time.perf_counter()
         input_texts = [self.model._build_assistant_text(text)]
         input_ids = self.model._tokenize_texts(input_texts)
 
@@ -998,6 +1176,9 @@ class FasterQwen3TTS:
                 ]
             ]
 
+        tokenize_wall_ms = (time.perf_counter() - tokenize_started) * 1000
+
+        prompt_started = time.perf_counter()
         vcp, ref_ids, using_icl_mode = self._resolve_voice_clone_prompt(
             input_ids=input_ids,
             ref_audio=ref_audio,
@@ -1006,6 +1187,7 @@ class FasterQwen3TTS:
             append_silence=append_silence,
             voice_clone_prompt=voice_clone_prompt,
         )
+        prompt_resolution_wall_ms = (time.perf_counter() - prompt_started) * 1000
 
         if instruct and not using_icl_mode:
             logger.warning(
@@ -1017,7 +1199,8 @@ class FasterQwen3TTS:
 
         m = self.model.model
 
-        tie, tam, tth, tpe = self._build_talker_inputs_local(
+        build_started = time.perf_counter()
+        tie, tam, tth, tpe, mask_metadata = self._build_talker_inputs_local(
             m=m,
             input_ids=input_ids,
             ref_ids=ref_ids,
@@ -1026,7 +1209,9 @@ class FasterQwen3TTS:
             speakers=None,
             non_streaming_mode=non_streaming_mode,
             instruct_ids=instruct_ids,
+            return_mask_metadata=True,
         )
+        build_talker_inputs_wall_ms = (time.perf_counter() - build_started) * 1000
 
         if not self._warmed_up:
             self.warmup(tie.shape[1])
@@ -1040,6 +1225,36 @@ class FasterQwen3TTS:
         ref_codes = None
         if using_icl_mode and vcp.get("ref_code") and vcp["ref_code"][0] is not None:
             ref_codes = vcp["ref_code"][0]
+
+        if return_metadata:
+            instruct_id = instruct_ids[0] if instruct_ids else None
+            metadata = {
+                "text_token_count": int(input_ids[0].shape[-1]) if input_ids else 0,
+                "instruction_token_count": (
+                    int(instruct_id.shape[-1]) if instruct_id is not None else 0
+                ),
+                "talker_prefill_length": int(tie.shape[1]),
+                "prefill_batch_size": int(tie.shape[0]),
+                "voice_clone_prompt_mode": "icl" if using_icl_mode else "x_vector",
+                "voice_clone_prompt_source": (
+                    "precomputed" if voice_clone_prompt is not None else "reference"
+                ),
+                "voice_clone_prompt_resolution_wall_ms": prompt_resolution_wall_ms,
+                **mask_metadata,
+                "prefill_has_sliding_window": bool(
+                    getattr(talker_model_config, "sliding_window", None) is not None
+                ),
+                "prefill_attn_implementation": getattr(
+                    talker_model_config, "_attn_implementation", "eager"
+                ),
+                "tokenize_wall_ms": tokenize_wall_ms,
+                "build_talker_inputs_wall_ms": build_talker_inputs_wall_ms,
+            }
+            if _profile_input_hashes_enabled():
+                metadata["talker_input_position_sha256"] = (
+                    _talker_input_position_hashes(tie)
+                )
+            return m, talker, config, tie, tam, tth, tpe, ref_codes, metadata
 
         return m, talker, config, tie, tam, tth, tpe, ref_codes
 
@@ -1577,6 +1792,15 @@ class FasterQwen3TTS:
         ref_spk_emb: Optional[np.ndarray] = None,
         ref_codes: Optional[np.ndarray] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+        profile_prefill: bool = False,
+        profile_nvtx: bool = False,
+        profile_request_role: Optional[str] = None,
+        prefill_backend: Optional[str] = None,
+        prefill_compile_compat_mode: Optional[str] = None,
+        voice_prefix_kv_reuse_enabled: bool = False,
+        voice_prefix_kv_cache_key: Optional[str] = None,
+        voice_prefix_kv_reuse_prefix_length: int = 86,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         """
         Stream voice-cloned speech generation, yielding audio chunks.
@@ -1627,6 +1851,11 @@ class FasterQwen3TTS:
             ref_codes=ref_codes,
         )
 
+        prefill_compile_compat_mode = self._resolve_prefill_compile_compat_mode(
+            prefill_compile_compat_mode
+        )
+        prefill_backend = self._resolve_prefill_backend(prefill_backend)
+
         from .streaming import (
             _normalize_chunk_schedule,
             fast_generate_streaming,
@@ -1652,7 +1881,7 @@ class FasterQwen3TTS:
             if diagnostics_enabled
             else None
         )
-        m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
+        m, talker, config, tie, tam, tth, tpe, ref_codes, input_metadata = self._prepare_generation(
             text=text,
             language=language,
             ref_audio=ref_audio,
@@ -1662,7 +1891,10 @@ class FasterQwen3TTS:
             append_silence=append_silence,
             voice_clone_prompt=voice_clone_prompt,
             instruct=instruct,
+            return_metadata=True,
         )
+        if profile_request_role:
+            input_metadata["profile_request_role"] = profile_request_role
 
         speech_tokenizer = m.speech_tokenizer
 
@@ -1720,12 +1952,44 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
         )
+        prefix_split_probe_enabled, prefix_split_probe_prefix_length = (
+            _prefix_split_probe_config()
+        )
         if normalized_chunk_schedule:
             stream_kwargs["chunk_schedule"] = normalized_chunk_schedule
         if not parity_mode:
             stream_kwargs["predictor_graph"] = self._select_predictor_graph(do_sample)
             stream_kwargs["talker_graph"] = self.talker_graph
             stream_kwargs["termination_sink"] = termination_trace
+            stream_kwargs.update(
+                {
+                    "input_metadata": input_metadata,
+                    "profile_prefill": profile_prefill,
+                    "profile_nvtx": profile_nvtx,
+                    "prefill_backend": prefill_backend,
+                    "prefill_compile_compat_mode": prefill_compile_compat_mode,
+                    "prefill_compile_lengths": self.prefill_compile_lengths,
+                    "prefill_compile_on_miss": self.prefill_compile_on_miss,
+                    "prefill_unknown_shape_policy": self.prefill_unknown_shape_policy,
+                    "prefill_require_precompiled": self.prefill_require_precompiled,
+                    "prefix_split_probe_enabled": prefix_split_probe_enabled,
+                    "prefix_split_probe_prefix_length": prefix_split_probe_prefix_length,
+                    "voice_prefix_kv_reuse_enabled": voice_prefix_kv_reuse_enabled,
+                    "voice_prefix_kv_cache_key": voice_prefix_kv_cache_key,
+                    "voice_prefix_kv_reuse_prefix_length": (
+                        voice_prefix_kv_reuse_prefix_length
+                    ),
+                    "cancel_check": cancel_check,
+                }
+            )
+        else:
+            stream_kwargs.update(
+                {
+                    "input_metadata": input_metadata,
+                    "profile_prefill": profile_prefill,
+                    "profile_nvtx": profile_nvtx,
+                }
+            )
 
         for codec_chunk, timing in stream_fn(**stream_kwargs):
             all_codes.append(codec_chunk)
@@ -2013,7 +2277,7 @@ class FasterQwen3TTS:
         termination_trace: dict = {}
         previous_tail: Optional[np.ndarray] = None
 
-        for codec_chunk, timing in fast_generate_streaming(
+        codec_source = fast_generate_streaming(
             talker=talker,
             talker_input_embeds=tie,
             attention_mask=tam,
@@ -2044,7 +2308,20 @@ class FasterQwen3TTS:
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
             prefill_require_precompiled=self.prefill_require_precompiled,
             cancel_check=cancel_check,
-        ):
+        )
+        async_codec_stream = None
+        if _use_async_codec_decode() and _use_codec_right_padded_decode():
+            codec_source = _prefetch_codec_chunks(
+                codec_source,
+                device=talker.device,
+            )
+            async_codec_stream = _decoder_async_codec_stream(speech_tokenizer)
+            if async_codec_stream is None:
+                raise RuntimeError(
+                    "async codec decode requires capture on its dedicated CUDA stream"
+                )
+
+        for codec_chunk, timing in codec_source:
             wrapper_started = time.perf_counter()
             context_started = time.perf_counter()
             all_codes.append(codec_chunk)
@@ -2075,11 +2352,24 @@ class FasterQwen3TTS:
                 codec_start_event.record()
             codec_decode_started = time.perf_counter()
             if _use_codec_right_padded_decode():
-                audio_list, sr = _decode_right_padded_window(
-                    speech_tokenizer,
-                    decode_input.to(talker.device),
-                    _codec_right_padded_decode_window_frames(),
-                )
+                if async_codec_stream is None:
+                    audio_list, sr = _decode_right_padded_window(
+                        speech_tokenizer,
+                        decode_input.to(talker.device),
+                        _codec_right_padded_decode_window_frames(),
+                    )
+                else:
+                    async_codec_stream.wait_stream(torch.cuda.current_stream(talker.device))
+                    with torch.cuda.stream(async_codec_stream):
+                        audio_list, sr = _decode_right_padded_window(
+                            speech_tokenizer,
+                            decode_input.to(talker.device),
+                            _codec_right_padded_decode_window_frames(),
+                        )
+                    # The helper performs the device-to-host copy on the codec
+                    # stream. Synchronize only that stream so the producer's
+                    # default-stream AR work remains overlapped.
+                    async_codec_stream.synchronize()
             else:
                 audio_list, sr = speech_tokenizer.decode(
                     {"audio_codes": decode_input.unsqueeze(0)}

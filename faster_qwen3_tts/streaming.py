@@ -7,6 +7,7 @@ CUDA graph usage is identical to non-streaming — same per-step performance.
 """
 
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -16,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from .generate import get_eos_tracker, get_fused_codec_embeddings
+from .first_chunk_profiler import create_first_chunk_profiler
 from .prefill_compat import (
     ensure_prefill_compile_compat,
     normalize_prefill_compile_compat_mode,
@@ -37,6 +39,12 @@ _PREFILL_BACKENDS = {
     "compile_reduce_overhead",
 }
 
+
+def _drop_prefill_hidden_states() -> bool:
+    """Return whether the diagnostic prefill memory optimization is enabled."""
+
+    return os.environ.get("QTB_FASTER_DROP_PREFILL_HIDDEN_STATES") == "1"
+
 # Scheduled chunks are a latency feature, not a bulk-output control. Keeping
 # their target bounded prevents an accidental configuration from hiding output
 # for multiple seconds before the next PCM callback.
@@ -50,10 +58,182 @@ _PREFILL_COMPILE_ERRORS = OrderedDict()
 _PREFILL_COMPILE_CALL_COUNTS = {}
 _PREFILL_COMPILE_EVICTIONS = 0
 _PREFILL_COMPILE_CACHE_LOCK = threading.RLock()
+_VOICE_PREFIX_KV_CACHE_MAX_ENTRIES = 8
 
 
 class UnsupportedPrefillConfiguration(ValueError):
     """Raised when a requested prefill backend/mask combination is unsafe."""
+
+
+def _prefix_split_probe_result() -> dict[str, Any]:
+    """Return the stable disabled/default shape for the split-forward probe."""
+
+    return {
+        "prefix_split_probe_enabled": False,
+        "prefix_split_probe_attempted": False,
+        "prefix_split_probe_supported": False,
+        "prefix_split_probe_prefix_length": 0,
+        "prefix_split_probe_error": None,
+        "prefix_split_probe_hidden_max_abs_delta": None,
+        "prefix_split_probe_hidden_mean_abs_delta": None,
+        "prefix_split_probe_prefix_hidden_max_abs_delta": None,
+        "prefix_split_probe_prefix_hidden_mean_abs_delta": None,
+        "prefix_split_probe_logits_max_abs_delta": None,
+        "prefix_split_probe_logits_allclose": None,
+        "prefix_split_probe_kv_max_abs_delta": None,
+        "prefix_split_probe_kv_allclose": None,
+        "prefix_split_probe_prefix_kv_max_abs_delta": None,
+        "prefix_split_probe_prefix_kv_allclose": None,
+        "prefix_split_probe_seeded_hidden_max_abs_delta": None,
+        "prefix_split_probe_seeded_hidden_mean_abs_delta": None,
+        "prefix_split_probe_seeded_logits_max_abs_delta": None,
+        "prefix_split_probe_seeded_logits_allclose": None,
+        "prefix_split_probe_seeded_first_token_match": None,
+        "prefix_split_probe_seeded_kv_max_abs_delta": None,
+        "prefix_split_probe_seeded_kv_allclose": None,
+        "prefix_split_probe_first_token_match": None,
+    }
+
+
+def _voice_prefix_reuse_profile() -> dict[str, Any]:
+    """Return stable telemetry for the opt-in perceptual-risk prefill path."""
+
+    return {
+        "voice_prefix_kv_reuse_enabled": False,
+        "voice_prefix_kv_reuse_hit": False,
+        "voice_prefix_kv_reuse_prefix_length": 0,
+        "voice_prefix_kv_reuse_cache_entries": 0,
+        "voice_prefix_kv_reuse_prefix_mismatch": False,
+    }
+
+
+def _voice_prefix_cache_for(talker) -> OrderedDict:
+    cache = getattr(talker, "_qtb_voice_prefix_kv_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        setattr(talker, "_qtb_voice_prefix_kv_cache", cache)
+    return cache
+
+
+def _cache_data(past_key_values, prefix_length: int) -> list[tuple[Any, Any]]:
+    layers = getattr(past_key_values, "layers", None)
+    if layers is None:
+        raise RuntimeError("voice prefix reuse requires a layered dynamic cache")
+    data = []
+    for layer in layers:
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        if keys is None or values is None:
+            raise RuntimeError("voice prefix cache tensors are unavailable")
+        data.append(
+            (
+                keys[..., :prefix_length, :].clone(),
+                values[..., :prefix_length, :].clone(),
+            )
+        )
+    return data
+
+
+def _new_cache(cache_type: type, cache_data: list[tuple[Any, Any]]):
+    try:
+        return cache_type(ddp_cache_data=cache_data)
+    except TypeError:
+        return cache_type(cache_data)
+
+
+def _run_voice_prefix_reuse(
+    talker,
+    talker_input_embeds: torch.Tensor,
+    trailing_text_hiddens: torch.Tensor,
+    tts_pad_embed: torch.Tensor,
+    *,
+    cache_key: str,
+    prefix_length: int,
+    input_metadata: Optional[dict],
+):
+    """Run suffix prefill from per-voice KV with explicit perceptual risk."""
+
+    total_length = int(talker_input_embeds.shape[1])
+    if not cache_key:
+        raise ValueError("voice prefix reuse requires a non-empty cache key")
+    if prefix_length <= 0 or prefix_length >= total_length:
+        raise ValueError("voice prefix reuse length must be inside the prefill")
+    if not isinstance(input_metadata, dict):
+        raise ValueError("voice prefix reuse requires validated input metadata")
+    if input_metadata.get("prefill_attention_mask_all_valid") is not True:
+        raise ValueError("voice prefix reuse requires an all-valid attention mask")
+    if input_metadata.get("prefill_batch_size") != 1:
+        raise ValueError("voice prefix reuse requires batch size one")
+    if input_metadata.get("prefill_has_sliding_window") is True:
+        raise ValueError("voice prefix reuse does not support sliding-window attention")
+
+    inner = getattr(talker, "model", None)
+    if inner is None:
+        raise RuntimeError("talker.model is unavailable")
+    prefix = talker_input_embeds[:, :prefix_length]
+    cache = _voice_prefix_cache_for(talker)
+    scoped_key = (
+        str(cache_key),
+        int(prefix_length),
+        str(talker_input_embeds.device),
+        str(talker_input_embeds.dtype),
+    )
+    entry = cache.pop(scoped_key, None)
+    prefix_mismatch = False
+    if entry is not None and not torch.equal(entry["prefix"], prefix):
+        entry = None
+        prefix_mismatch = True
+
+    cache_hit = entry is not None
+    if entry is None:
+        prefix_out = inner(
+            inputs_embeds=prefix,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            use_cache=True,
+            output_hidden_states=False,
+            cache_position=None,
+            skip_prefill_causal_mask=True,
+        )
+        entry = {
+            "prefix": prefix.clone(),
+            "cache_type": type(prefix_out.past_key_values),
+            "cache_data": _cache_data(prefix_out.past_key_values, prefix_length),
+        }
+    cache[scoped_key] = entry
+    while len(cache) > _VOICE_PREFIX_KV_CACHE_MAX_ENTRIES:
+        cache.popitem(last=False)
+
+    seeded_cache = _new_cache(entry["cache_type"], entry["cache_data"])
+    out = talker.forward(
+        inputs_embeds=talker_input_embeds[:, prefix_length:],
+        attention_mask=None,
+        use_cache=True,
+        output_hidden_states=not _drop_prefill_hidden_states(),
+        return_dict=True,
+        trailing_text_hidden=trailing_text_hiddens,
+        tts_pad_embed=tts_pad_embed,
+        generation_step=None,
+        past_hidden=None,
+        past_key_values=seeded_cache,
+        skip_prefill_causal_mask=False,
+    )
+    profile = _voice_prefix_reuse_profile()
+    profile.update(
+        {
+            "voice_prefix_kv_reuse_enabled": True,
+            "voice_prefix_kv_reuse_hit": cache_hit,
+            "voice_prefix_kv_reuse_prefix_length": int(prefix_length),
+            "voice_prefix_kv_reuse_cache_entries": len(cache),
+            "voice_prefix_kv_reuse_prefix_mismatch": prefix_mismatch,
+            "prefill_backend_requested": "voice_prefix_kv_reuse",
+            "prefill_backend_used": "voice_prefix_kv_reuse",
+            "prefill_shape_policy": "voice_prefix_kv_reuse",
+            "prefill_shape_length": total_length,
+        }
+    )
+    return out, profile
 
 
 class _CudaNvtxRange:
@@ -78,6 +258,27 @@ class _DecodePhaseTimer:
     def __init__(self, device: torch.device, enabled: bool) -> None:
         self._enabled = bool(enabled and device.type == "cuda")
         self._pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self._frame_records: list[dict[str, Any]] = []
+        self._active_frame: dict[str, Any] | None = None
+
+    def begin_frame(self, frame_index: int) -> None:
+        if not self._enabled:
+            return
+        self._active_frame = {
+            "frame_index": int(frame_index),
+            "host_started": time.perf_counter(),
+            "pairs": {},
+        }
+
+    def end_frame(self) -> None:
+        if self._active_frame is None:
+            return
+        started = self._active_frame.pop("host_started")
+        self._active_frame["host_wall_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        self._frame_records.append(self._active_frame)
+        self._active_frame = None
 
     def begin(self, name: str) -> torch.cuda.Event | None:
         if not self._enabled:
@@ -92,12 +293,38 @@ class _DecodePhaseTimer:
         end = torch.cuda.Event(enable_timing=True)
         end.record()
         self._pairs.setdefault(name, []).append((start, end))
+        if self._active_frame is not None:
+            self._active_frame["pairs"].setdefault(name, []).append((start, end))
 
     def metrics(self) -> dict[str, float]:
         return {
             f"{name}_gpu_ms": sum(start.elapsed_time(end) for start, end in pairs)
             for name, pairs in self._pairs.items()
         }
+
+    def frame_metrics(self) -> list[dict[str, Any]]:
+        """Return per-frame GPU elapsed and host wall timings after synchronization."""
+
+        if not self._enabled:
+            return []
+        result = []
+        for record in self._frame_records:
+            phases = {
+                f"{name}_gpu_ms": sum(
+                    start.elapsed_time(end) for start, end in pairs
+                )
+                for name, pairs in record["pairs"].items()
+            }
+            gpu_total = sum(value for key, value in phases.items() if key.endswith("_gpu_ms"))
+            result.append(
+                {
+                    "frame_index": record["frame_index"],
+                    "host_wall_ms": record["host_wall_ms"],
+                    "gpu_total_ms": gpu_total,
+                    **phases,
+                }
+            )
+        return result
 
 
 def _normalize_prefill_backend(prefill_backend: str) -> str:
@@ -739,7 +966,7 @@ def _talker_prefill_eager(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
         use_cache=True,
-        output_hidden_states=True,
+        output_hidden_states=not _drop_prefill_hidden_states(),
         return_dict=True,
         trailing_text_hidden=trailing_text_hiddens,
         tts_pad_embed=tts_pad_embed,
@@ -819,6 +1046,263 @@ def _tensor_signature(tensor: Optional[torch.Tensor]) -> tuple:
     )
 
 
+@torch.inference_mode()
+def _run_prefix_split_probe(
+    talker,
+    talker_input_embeds: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    full_out,
+    prefix_length: int,
+    *,
+    input_metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Compare one full talker prefill with a fresh prefix/suffix forward.
+
+    This is deliberately diagnostic-only.  The split result is never returned to
+    generation: it only measures whether a future per-voice KV-cache reuse path
+    could preserve the current full-prefill semantics.
+    """
+
+    result = _prefix_split_probe_result()
+    result["prefix_split_probe_enabled"] = True
+    result["prefix_split_probe_prefix_length"] = int(prefix_length)
+    total_length = int(talker_input_embeds.shape[1])
+    if (
+        talker_input_embeds.ndim != 3
+        or talker_input_embeds.shape[0] != 1
+        or prefix_length <= 0
+        or prefix_length >= total_length
+    ):
+        result["prefix_split_probe_error"] = "unsupported_shape_or_prefix"
+        return result
+    if not isinstance(input_metadata, dict) or (
+        input_metadata.get("prefill_attention_mask_all_valid") is not True
+        or input_metadata.get("prefill_has_sliding_window") is True
+    ):
+        result["prefix_split_probe_error"] = "requires_all_valid_non_sliding_profile"
+        return result
+    if attention_mask is not None and not bool(torch.all(attention_mask == 1).item()):
+        result["prefix_split_probe_error"] = "requires_all_ones_attention_mask"
+        return result
+
+    result["prefix_split_probe_attempted"] = True
+    try:
+        inner = getattr(talker, "model", None)
+        if inner is None:
+            raise RuntimeError("talker.model is unavailable")
+        # Match the accepted full-prefill path exactly for the reusable prefix.
+        # An explicit all-ones mask is mathematically equivalent, but it selects
+        # a different SDPA path and produced materially different FP16 KV values
+        # on CMP 50HX.  The suffix cannot use the prefill-only mask shortcut
+        # because it starts with a populated cache, so let the model construct
+        # the causal mask and positions from that cache.
+        prefix_out = inner(
+            inputs_embeds=talker_input_embeds[:, :prefix_length],
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            use_cache=True,
+            output_hidden_states=True,
+            cache_position=None,
+            skip_prefill_causal_mask=True,
+        )
+
+        full_hidden = getattr(full_out, "last_hidden_state", None)
+        if full_hidden is None:
+            hidden_states = getattr(full_out, "hidden_states", None)
+            if hidden_states and isinstance(hidden_states[0], tuple):
+                full_hidden = hidden_states[0][-1]
+            elif hidden_states:
+                full_hidden = hidden_states[-1]
+        if full_hidden is None or prefix_out.last_hidden_state is None:
+            raise RuntimeError("hidden state output is unavailable")
+
+        prefix_hidden_delta = (
+            prefix_out.last_hidden_state.float()
+            - full_hidden[:, :prefix_length].float()
+        ).abs()
+        result["prefix_split_probe_prefix_hidden_max_abs_delta"] = float(
+            prefix_hidden_delta.max().item()
+        )
+        result["prefix_split_probe_prefix_hidden_mean_abs_delta"] = float(
+            prefix_hidden_delta.mean().item()
+        )
+
+        full_cache = full_out.past_key_values
+        prefix_cache = prefix_out.past_key_values
+        layers = getattr(full_cache, "layers", None)
+        prefix_layers = getattr(prefix_cache, "layers", None)
+        if layers is None or prefix_layers is None or len(layers) != len(prefix_layers):
+            raise RuntimeError("unsupported cache representation")
+
+        prefix_kv_max = 0.0
+        prefix_kv_allclose = True
+        seeded_cache_data = []
+        for full_layer, prefix_layer in zip(layers, prefix_layers):
+            full_keys = getattr(full_layer, "keys", None)
+            full_values = getattr(full_layer, "values", None)
+            prefix_keys = getattr(prefix_layer, "keys", None)
+            prefix_values = getattr(prefix_layer, "values", None)
+            if any(
+                tensor is None
+                for tensor in (full_keys, full_values, prefix_keys, prefix_values)
+            ):
+                raise RuntimeError("cache layer tensors are unavailable")
+            for full_tensor, prefix_tensor in (
+                (full_keys, prefix_keys),
+                (full_values, prefix_values),
+            ):
+                delta = (
+                    prefix_tensor.float()
+                    - full_tensor[..., :prefix_length, :].float()
+                ).abs()
+                prefix_kv_max = max(prefix_kv_max, float(delta.max().item()))
+                prefix_kv_allclose = prefix_kv_allclose and bool(
+                    torch.allclose(
+                        prefix_tensor,
+                        full_tensor[..., :prefix_length, :],
+                        rtol=5e-2,
+                        atol=5e-2,
+                    )
+                )
+            seeded_cache_data.append(
+                (
+                    full_keys[..., :prefix_length, :].clone(),
+                    full_values[..., :prefix_length, :].clone(),
+                )
+            )
+        result["prefix_split_probe_prefix_kv_max_abs_delta"] = prefix_kv_max
+        result["prefix_split_probe_prefix_kv_allclose"] = prefix_kv_allclose
+
+        cache_type = type(full_cache)
+        try:
+            seeded_cache = cache_type(ddp_cache_data=seeded_cache_data)
+        except TypeError:
+            seeded_cache = cache_type(seeded_cache_data)
+        seeded_suffix_out = inner(
+            inputs_embeds=talker_input_embeds[:, prefix_length:],
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=seeded_cache,
+            use_cache=True,
+            output_hidden_states=True,
+            cache_position=None,
+        )
+        suffix_out = inner(
+            inputs_embeds=talker_input_embeds[:, prefix_length:],
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=prefix_out.past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            cache_position=None,
+        )
+
+        split_hidden = suffix_out.last_hidden_state
+        seeded_hidden = seeded_suffix_out.last_hidden_state
+        if split_hidden is None or seeded_hidden is None:
+            raise RuntimeError("hidden state output is unavailable")
+        full_suffix = full_hidden[:, prefix_length:]
+        hidden_delta = (split_hidden.float() - full_suffix.float()).abs()
+        result["prefix_split_probe_hidden_max_abs_delta"] = float(hidden_delta.max().item())
+        result["prefix_split_probe_hidden_mean_abs_delta"] = float(hidden_delta.mean().item())
+        seeded_hidden_delta = (seeded_hidden.float() - full_suffix.float()).abs()
+        result["prefix_split_probe_seeded_hidden_max_abs_delta"] = float(
+            seeded_hidden_delta.max().item()
+        )
+        result["prefix_split_probe_seeded_hidden_mean_abs_delta"] = float(
+            seeded_hidden_delta.mean().item()
+        )
+
+        split_logits = talker.codec_head(split_hidden)
+        seeded_logits = talker.codec_head(seeded_hidden)
+        full_logits = getattr(full_out, "logits", None)
+        if full_logits is not None:
+            logits_delta = (split_logits.float() - full_logits[:, prefix_length:].float()).abs()
+            result["prefix_split_probe_logits_max_abs_delta"] = float(logits_delta.max().item())
+            result["prefix_split_probe_logits_allclose"] = bool(
+                torch.allclose(split_logits, full_logits[:, prefix_length:], rtol=5e-2, atol=5e-2)
+            )
+            result["prefix_split_probe_first_token_match"] = bool(
+                torch.argmax(split_logits[:, 0], dim=-1).item()
+                == torch.argmax(full_logits[:, prefix_length], dim=-1).item()
+            )
+            seeded_logits_delta = (
+                seeded_logits.float() - full_logits[:, prefix_length:].float()
+            ).abs()
+            result["prefix_split_probe_seeded_logits_max_abs_delta"] = float(
+                seeded_logits_delta.max().item()
+            )
+            result["prefix_split_probe_seeded_logits_allclose"] = bool(
+                torch.allclose(
+                    seeded_logits,
+                    full_logits[:, prefix_length:],
+                    rtol=5e-2,
+                    atol=5e-2,
+                )
+            )
+            result["prefix_split_probe_seeded_first_token_match"] = bool(
+                torch.argmax(seeded_logits[:, 0], dim=-1).item()
+                == torch.argmax(full_logits[:, prefix_length], dim=-1).item()
+            )
+
+        split_cache = suffix_out.past_key_values
+        seeded_split_cache = seeded_suffix_out.past_key_values
+        kv_max = 0.0
+        kv_allclose = True
+        seeded_kv_max = 0.0
+        seeded_kv_allclose = True
+        split_layers = getattr(split_cache, "layers", None)
+        seeded_split_layers = getattr(seeded_split_cache, "layers", None)
+        if (
+            split_layers is None
+            or seeded_split_layers is None
+            or len(layers) != len(split_layers)
+            or len(layers) != len(seeded_split_layers)
+        ):
+            raise RuntimeError("unsupported cache representation")
+        for full_layer, split_layer, seeded_split_layer in zip(
+            layers, split_layers, seeded_split_layers
+        ):
+            for name in ("keys", "values"):
+                full_tensor = getattr(full_layer, name, None)
+                split_tensor = getattr(split_layer, name, None)
+                seeded_split_tensor = getattr(seeded_split_layer, name, None)
+                if (
+                    full_tensor is None
+                    or split_tensor is None
+                    or seeded_split_tensor is None
+                ):
+                    raise RuntimeError("cache layer tensors are unavailable")
+                delta = (split_tensor.float() - full_tensor.float()).abs()
+                kv_max = max(kv_max, float(delta.max().item()))
+                kv_allclose = kv_allclose and bool(
+                    torch.allclose(split_tensor, full_tensor, rtol=5e-2, atol=5e-2)
+                )
+                seeded_delta = (
+                    seeded_split_tensor.float() - full_tensor.float()
+                ).abs()
+                seeded_kv_max = max(
+                    seeded_kv_max, float(seeded_delta.max().item())
+                )
+                seeded_kv_allclose = seeded_kv_allclose and bool(
+                    torch.allclose(
+                        seeded_split_tensor,
+                        full_tensor,
+                        rtol=5e-2,
+                        atol=5e-2,
+                    )
+                )
+        result["prefix_split_probe_kv_max_abs_delta"] = kv_max
+        result["prefix_split_probe_kv_allclose"] = kv_allclose
+        result["prefix_split_probe_seeded_kv_max_abs_delta"] = seeded_kv_max
+        result["prefix_split_probe_seeded_kv_allclose"] = seeded_kv_allclose
+        result["prefix_split_probe_supported"] = True
+    except Exception as exc:  # diagnostic probes must never break synthesis
+        result["prefix_split_probe_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def _jsonable_tensor_signature(signature: tuple) -> tuple:
     if not signature or signature[0] == "none":
         return signature
@@ -860,6 +1344,11 @@ def fast_generate_streaming(
     prefill_compile_on_miss: bool = True,
     prefill_unknown_shape_policy: str = "eager",
     prefill_require_precompiled: bool = False,
+    prefix_split_probe_enabled: bool = False,
+    prefix_split_probe_prefix_length: int = 86,
+    voice_prefix_kv_reuse_enabled: bool = False,
+    voice_prefix_kv_cache_key: Optional[str] = None,
+    voice_prefix_kv_reuse_prefix_length: int = 86,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
@@ -905,6 +1394,9 @@ def fast_generate_streaming(
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.perf_counter()
     prefill_profile = {}
+    prefill_profile.update(_prefix_split_probe_result())
+    prefill_profile.update(_voice_prefix_reuse_profile())
+    prefill_profile["prefix_split_probe_enabled"] = bool(prefix_split_probe_enabled)
     prefill_events = _PrefillEvents(device, profile_prefill)
     nvtx_enabled = profile_nvtx and device.type == "cuda"
     outer_nvtx_name = _profile_outer_nvtx_name(input_metadata)
@@ -917,25 +1409,49 @@ def fast_generate_streaming(
 
     forward_started = time.perf_counter()
     with _CudaNvtxRange("qtb_prefill_talker_forward", nvtx_enabled):
-        out, backend_profile = _run_talker_prefill(
-            talker,
-            talker_input_embeds,
-            attention_mask,
-            trailing_text_hiddens,
-            tts_pad_embed,
-            prefill_backend=prefill_backend,
-            prefill_mask_mode=prefill_mask_mode,
-            prefill_compile_compat_mode=prefill_compile_compat_mode,
-            prefill_compile_lengths=compile_lengths,
-            prefill_compile_on_miss=prefill_compile_on_miss,
-            prefill_unknown_shape_policy=unknown_shape_policy,
-            prefill_require_precompiled=prefill_require_precompiled,
-            input_metadata=input_metadata,
-        )
+        if voice_prefix_kv_reuse_enabled:
+            if prefill_backend != "eager":
+                raise ValueError("voice prefix reuse requires eager prefill")
+            out, backend_profile = _run_voice_prefix_reuse(
+                talker,
+                talker_input_embeds,
+                trailing_text_hiddens,
+                tts_pad_embed,
+                cache_key=str(voice_prefix_kv_cache_key or ""),
+                prefix_length=int(voice_prefix_kv_reuse_prefix_length),
+                input_metadata=input_metadata,
+            )
+        else:
+            out, backend_profile = _run_talker_prefill(
+                talker,
+                talker_input_embeds,
+                attention_mask,
+                trailing_text_hiddens,
+                tts_pad_embed,
+                prefill_backend=prefill_backend,
+                prefill_mask_mode=prefill_mask_mode,
+                prefill_compile_compat_mode=prefill_compile_compat_mode,
+                prefill_compile_lengths=compile_lengths,
+                prefill_compile_on_miss=prefill_compile_on_miss,
+                prefill_unknown_shape_policy=unknown_shape_policy,
+                prefill_require_precompiled=prefill_require_precompiled,
+                input_metadata=input_metadata,
+            )
     prefill_profile["talker_forward_launch_wall_ms"] = (
         time.perf_counter() - forward_started
     ) * 1000
     prefill_profile.update(backend_profile)
+    if prefix_split_probe_enabled:
+        prefill_profile.update(
+            _run_prefix_split_probe(
+                talker,
+                talker_input_embeds,
+                attention_mask,
+                out,
+                int(prefix_split_probe_prefix_length),
+                input_metadata=input_metadata,
+            )
+        )
     normalized_chunk_schedule, schedule_decision = _select_chunk_schedule_for_prefill_route(
         normalized_chunk_schedule,
         compiled_chunk_schedule,
@@ -1054,6 +1570,9 @@ def fast_generate_streaming(
         "emitted_steps": 0,
     }
     chunk_start = time.time()
+    first_chunk_profiler = create_first_chunk_profiler(device)
+    if first_chunk_profiler is not None:
+        first_chunk_profiler.start()
 
     for step_idx in range(max_new_tokens):
         if cancel_check is not None and cancel_check():
@@ -1098,6 +1617,8 @@ def fast_generate_streaming(
             )
             break
 
+        decode_phase_timer.begin_frame(step_idx)
+
         # --- CUDA-Graphed Code Predictor ---
         predictor_phase = decode_phase_timer.begin("ar_predictor_graph")
         last_id_hidden = talker_codec_embed(token.unsqueeze(1))
@@ -1134,6 +1655,7 @@ def fast_generate_streaming(
         # --- CUDA-Graphed Talker decode step ---
         current_pos = prefill_len + step_idx
         if current_pos >= talker_graph.max_seq_len - 1:
+            decode_phase_timer.end_frame()
             termination.update(
                 {
                     "termination_reason": "max_seq_len",
@@ -1172,9 +1694,13 @@ def fast_generate_streaming(
         next_slot = (step_idx + 1) % 2
         token_cpu[next_slot : next_slot + 1].copy_(token, non_blocking=True)
         token_events[next_slot].record()
-        past_hidden = hidden_states[:, -1:, :].clone()
+        # The next iteration consumes ``past_hidden`` before the next graph
+        # replay overwrites ``TalkerGraph.output_buf``.  Keep the static view
+        # instead of copying one hidden vector on every AR frame.
+        past_hidden = hidden_states[:, -1:, :]
         gen_step += 1
         decode_phase_timer.end("ar_state_update", state_phase)
+        decode_phase_timer.end_frame()
 
         # The optional schedule lowers time to first PCM without permanently
         # paying the smaller-chunk decode overhead in steady state.
@@ -1212,7 +1738,26 @@ def fast_generate_streaming(
             total_steps += len(chunk_buffer)
             is_final_chunk = eos_found or step_idx + 1 >= max_new_tokens
             if chunk_count == 0:
+                if first_chunk_profiler is not None:
+                    prefill_profile.update(first_chunk_profiler.stop())
+                    first_chunk_profiler = None
                 prefill_profile.update(decode_phase_timer.metrics())
+                prefill_profile["ar_frame_timings"] = decode_phase_timer.frame_metrics()
+                prefill_profile["predictor_output_mode"] = (
+                    "static_view"
+                    if getattr(predictor_graph, "returns_static_output", False)
+                    else "clone"
+                )
+                prefill_profile["decode_backbone_compile_enabled"] = bool(
+                    getattr(predictor_graph, "decode_compile_enabled", False)
+                    or getattr(talker_graph, "decode_compile_enabled", False)
+                )
+                prefill_profile["predictor_decode_compile_enabled"] = bool(
+                    getattr(predictor_graph, "decode_compile_enabled", False)
+                )
+                prefill_profile["talker_decode_compile_enabled"] = bool(
+                    getattr(talker_graph, "decode_compile_enabled", False)
+                )
 
             _validate_chunk_steps(
                 len(chunk_buffer),
@@ -1708,7 +2253,7 @@ def parity_generate_streaming(
             inputs_embeds=talker_input_embeds,
             attention_mask=attention_mask,
             use_cache=True,
-            output_hidden_states=True,
+            output_hidden_states=not _drop_prefill_hidden_states(),
             return_dict=True,
             trailing_text_hidden=trailing_text_hiddens,
             tts_pad_embed=tts_pad_embed,

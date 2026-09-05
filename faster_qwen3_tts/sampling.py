@@ -38,11 +38,19 @@ def apply_repetition_penalty(
     """
     if repetition_penalty == 1.0 or token_history.numel() == 0:
         return logits
-    unique_toks = token_history.unique()
-    tok_logits = logits[..., unique_toks]
-    logits[..., unique_toks] = torch.where(
-        tok_logits > 0, tok_logits / repetition_penalty, tok_logits * repetition_penalty
+    # ``Tensor.unique()`` materializes a dynamically sized result and forces a
+    # host synchronization on the sealed CMP runtime (about 28 ms per AR
+    # frame).  A fixed-size GPU mask preserves the HF semantics for duplicate
+    # history entries without a synchronization boundary.
+    flat_logits = logits.reshape(-1)
+    seen = torch.zeros_like(flat_logits, dtype=torch.bool)
+    seen.scatter_(0, token_history, True)
+    penalized = torch.where(
+        flat_logits > 0,
+        flat_logits / repetition_penalty,
+        flat_logits * repetition_penalty,
     )
+    flat_logits.copy_(torch.where(seen, penalized, flat_logits))
     return logits
 
 

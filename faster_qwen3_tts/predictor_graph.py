@@ -13,11 +13,14 @@ Strategy:
 - Unroll the full 15-step loop for deterministic shapes
 - Capture the entire loop as a single CUDA graph
 """
+import os
+
 import torch
 from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from .sampling import sample_logits
+from .attention_backend import sdpa_kernel_context
 
 
 class PredictorGraph:
@@ -48,6 +51,9 @@ class PredictorGraph:
         self.top_k = top_k
         self.top_p = top_p
         self.temperature = temperature
+        self.returns_static_output = (
+            os.environ.get("QTB_FASTER_PREDICTOR_STATIC_OUTPUT", "0") == "1"
+        )
 
         # Extract model components (references, not copies)
         cp = code_predictor
@@ -177,7 +183,8 @@ class PredictorGraph:
 
         for _ in range(num_warmup):
             self.static_cache.reset()
-            self._full_loop()
+            with sdpa_kernel_context():
+                self._full_loop()
         torch.cuda.synchronize()
 
         print("Capturing CUDA graph for predictor...")
@@ -189,12 +196,14 @@ class PredictorGraph:
                 self.graph = torch.cuda.CUDAGraph()
                 # Warmup in capture stream
                 self.static_cache.reset()
-                self._full_loop()
+                with sdpa_kernel_context():
+                    self._full_loop()
                 torch.cuda.synchronize()
 
                 self.static_cache.reset()
-                with torch.cuda.graph(self.graph):
-                    self._full_loop()
+                with sdpa_kernel_context():
+                    with torch.cuda.graph(self.graph):
+                        self._full_loop()
 
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
@@ -213,6 +222,8 @@ class PredictorGraph:
         # 0..max_seq-1 (prefill fills 0-1, the unrolled decode steps fill the rest)
         # before any attention reads them, so stale values are never attended.
         self.graph.replay()
+        if self.returns_static_output:
+            return self.output_tokens
         return self.output_tokens.clone()
 
     def reset(self) -> None:
