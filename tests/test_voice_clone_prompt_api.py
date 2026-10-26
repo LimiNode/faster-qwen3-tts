@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import types
 
@@ -273,6 +274,80 @@ def test_public_generation_methods_preserve_explicit_non_streaming_overrides(
             next(result)
 
     assert captured["non_streaming_mode"] is override
+
+
+def test_voice_design_streaming_records_generation_trace(monkeypatch):
+    model = _build_dummy_model()
+    model.model.model.tts_model_type = "voice_design"
+    model.collect_generation_trace = True
+    model.last_generation_trace = {"stale": True}
+
+    codec_chunk = torch.tensor(
+        [[1, 2], [3, 4]],
+        dtype=torch.long,
+    )
+    expected_hash = hashlib.sha256(
+        codec_chunk.to(dtype=torch.int32).contiguous().numpy().tobytes()
+    ).hexdigest()
+    speech_tokenizer = types.SimpleNamespace(
+        decode=lambda _payload: ([torch.zeros(320, dtype=torch.float32)], 24000),
+    )
+    prepared_model = types.SimpleNamespace(speech_tokenizer=speech_tokenizer)
+    talker = types.SimpleNamespace(device=torch.device("cpu"))
+    monkeypatch.setattr(
+        model,
+        "_prepare_generation_custom",
+        lambda **_kwargs: (
+            prepared_model,
+            talker,
+            types.SimpleNamespace(),
+            torch.zeros(1, 1, 4),
+            torch.ones(1, 1, dtype=torch.long),
+            torch.zeros(1, 1, 4),
+            torch.zeros(1, 1, 4),
+            {},
+        ),
+    )
+
+    def _stream(**kwargs):
+        kwargs["termination_sink"].update(
+            {
+                "termination_reason": "eos",
+                "terminal_token_id": 2150,
+                "terminal_step_index": 2,
+                "generated_steps": 2,
+                "emitted_steps": 2,
+                "hit_eos": True,
+                "hit_max_new_tokens": False,
+                "hit_max_seq_len": False,
+            }
+        )
+        yield codec_chunk, {"is_final": True}
+
+    monkeypatch.setattr("faster_qwen3_tts.streaming.fast_generate_streaming", _stream)
+
+    chunks = list(
+        model.generate_voice_design_streaming(
+            text="hello",
+            instruct="warm voice",
+            language="English",
+        )
+    )
+
+    assert len(chunks) == 1
+    assert model.last_generation_trace == {
+        "trace_kind": "voice_design_streaming_v1",
+        "codec_sha256": expected_hash,
+        "codec_frame_count": 2,
+        "termination_reason": "eos",
+        "terminal_token_id": 2150,
+        "terminal_step_index": 2,
+        "generated_steps": 2,
+        "emitted_steps": 2,
+        "hit_eos": True,
+        "hit_max_new_tokens": False,
+        "hit_max_seq_len": False,
+    }
 
 
 def test_prepare_generation_uses_precomputed_xvec_prompt_without_prompt_extraction():
