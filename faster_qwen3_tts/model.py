@@ -2613,10 +2613,15 @@ class FasterQwen3TTS:
             *(normalized_chunk_schedule or (chunk_size,)),
         )
         all_codes = []
+        codec_hasher = hashlib.sha256() if self.collect_generation_trace else None
+        codec_frame_count = 0
+        termination_trace: dict = {}
+        if codec_hasher is not None:
+            self.last_generation_trace = None
         prev_audio_len = 0
         samples_per_frame = None
 
-        for codec_chunk, timing in fast_generate_streaming(
+        codec_source = fast_generate_streaming(
             talker=talker,
             talker_input_embeds=tie,
             attention_mask=tam,
@@ -2635,6 +2640,7 @@ class FasterQwen3TTS:
             chunk_size=chunk_size,
             chunk_schedule=normalized_chunk_schedule,
             input_metadata=input_metadata,
+            termination_sink=termination_trace,
             profile_prefill=profile_prefill,
             profile_nvtx=profile_nvtx,
             prefill_backend=prefill_backend,
@@ -2644,9 +2650,21 @@ class FasterQwen3TTS:
             prefill_unknown_shape_policy=self.prefill_unknown_shape_policy,
             prefill_require_precompiled=self.prefill_require_precompiled,
             cancel_check=cancel_check,
-        ):
+        )
+
+        for codec_chunk, timing in codec_source:
             all_codes.append(codec_chunk)
             n_new = codec_chunk.shape[0]
+            if codec_hasher is not None:
+                codec_bytes = (
+                    codec_chunk.detach()
+                    .to(device="cpu", dtype=torch.int32)
+                    .contiguous()
+                    .numpy()
+                    .tobytes()
+                )
+                codec_hasher.update(codec_bytes)
+                codec_frame_count += int(n_new)
             all_flat = torch.cat(all_codes, dim=0)
             n_total = all_flat.shape[0]
 
@@ -2686,3 +2704,18 @@ class FasterQwen3TTS:
                     new_audio = audio
 
             yield new_audio, sr, timing
+
+        if codec_hasher is not None:
+            self.last_generation_trace = {
+                "trace_kind": "voice_design_streaming_v1",
+                "codec_sha256": codec_hasher.hexdigest(),
+                "codec_frame_count": codec_frame_count,
+                "termination_reason": termination_trace.get("termination_reason"),
+                "terminal_token_id": termination_trace.get("terminal_token_id"),
+                "terminal_step_index": termination_trace.get("terminal_step_index"),
+                "generated_steps": termination_trace.get("generated_steps"),
+                "emitted_steps": termination_trace.get("emitted_steps"),
+                "hit_eos": termination_trace.get("hit_eos"),
+                "hit_max_new_tokens": termination_trace.get("hit_max_new_tokens"),
+                "hit_max_seq_len": termination_trace.get("hit_max_seq_len"),
+            }

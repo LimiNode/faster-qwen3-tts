@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import types
 
@@ -273,6 +274,260 @@ def test_public_generation_methods_preserve_explicit_non_streaming_overrides(
             next(result)
 
     assert captured["non_streaming_mode"] is override
+
+
+def test_voice_design_streaming_records_generation_trace(monkeypatch):
+    model = _build_dummy_model()
+    model.model.model.tts_model_type = "voice_design"
+    model.collect_generation_trace = True
+    model.last_generation_trace = {"stale": True}
+
+    codec_chunk = torch.tensor(
+        [[1, 2], [3, 4]],
+        dtype=torch.long,
+    )
+    expected_hash = hashlib.sha256(
+        codec_chunk.to(dtype=torch.int32).contiguous().numpy().tobytes()
+    ).hexdigest()
+    speech_tokenizer = types.SimpleNamespace(
+        decode=lambda _payload: ([torch.zeros(320, dtype=torch.float32)], 24000),
+    )
+    prepared_model = types.SimpleNamespace(speech_tokenizer=speech_tokenizer)
+    talker = types.SimpleNamespace(device=torch.device("cpu"))
+    monkeypatch.setattr(
+        model,
+        "_prepare_generation_custom",
+        lambda **_kwargs: (
+            prepared_model,
+            talker,
+            types.SimpleNamespace(),
+            torch.zeros(1, 1, 4),
+            torch.ones(1, 1, dtype=torch.long),
+            torch.zeros(1, 1, 4),
+            torch.zeros(1, 1, 4),
+            {},
+        ),
+    )
+
+    def _stream(**kwargs):
+        kwargs["termination_sink"].update(
+            {
+                "termination_reason": "eos",
+                "terminal_token_id": 2150,
+                "terminal_step_index": 2,
+                "generated_steps": 2,
+                "emitted_steps": 2,
+                "hit_eos": True,
+                "hit_max_new_tokens": False,
+                "hit_max_seq_len": False,
+            }
+        )
+        yield codec_chunk, {"is_final": True}
+
+    monkeypatch.setattr("faster_qwen3_tts.streaming.fast_generate_streaming", _stream)
+
+    chunks = list(
+        model.generate_voice_design_streaming(
+            text="hello",
+            instruct="warm voice",
+            language="English",
+        )
+    )
+
+    assert len(chunks) == 1
+    assert model.last_generation_trace == {
+        "trace_kind": "voice_design_streaming_v1",
+        "codec_sha256": expected_hash,
+        "codec_frame_count": 2,
+        "termination_reason": "eos",
+        "terminal_token_id": 2150,
+        "terminal_step_index": 2,
+        "generated_steps": 2,
+        "emitted_steps": 2,
+        "hit_eos": True,
+        "hit_max_new_tokens": False,
+        "hit_max_seq_len": False,
+    }
+
+
+def _configure_voice_design_stream(monkeypatch, stream_factory, *, collect=True):
+    model = _build_dummy_model()
+    model.model.model.tts_model_type = "voice_design"
+    model.collect_generation_trace = collect
+
+    codec_chunk = torch.tensor(
+        [[1, 2], [3, 4]],
+        dtype=torch.long,
+    )
+    speech_tokenizer = types.SimpleNamespace(
+        decode=lambda _payload: ([torch.zeros(320, dtype=torch.float32)], 24000),
+    )
+    prepared_model = types.SimpleNamespace(speech_tokenizer=speech_tokenizer)
+    talker = types.SimpleNamespace(device=torch.device("cpu"))
+    monkeypatch.setattr(
+        model,
+        "_prepare_generation_custom",
+        lambda **_kwargs: (
+            prepared_model,
+            talker,
+            types.SimpleNamespace(),
+            torch.zeros(1, 1, 4),
+            torch.ones(1, 1, dtype=torch.long),
+            torch.zeros(1, 1, 4),
+            torch.zeros(1, 1, 4),
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        "faster_qwen3_tts.streaming.fast_generate_streaming",
+        stream_factory(codec_chunk),
+    )
+    return model
+
+
+@pytest.mark.parametrize(
+    ("termination_reason", "hit_eos", "hit_max_new_tokens", "hit_max_seq_len"),
+    [
+        ("max_new_tokens", False, True, False),
+        ("max_seq_len", False, False, True),
+    ],
+)
+def test_voice_design_limits_are_not_reported_as_natural_eos(
+    monkeypatch,
+    termination_reason,
+    hit_eos,
+    hit_max_new_tokens,
+    hit_max_seq_len,
+):
+    termination = {
+        "termination_reason": termination_reason,
+        "terminal_token_id": None,
+        "terminal_step_index": 4,
+        "generated_steps": 5,
+        "emitted_steps": 4,
+        "hit_eos": hit_eos,
+        "hit_max_new_tokens": hit_max_new_tokens,
+        "hit_max_seq_len": hit_max_seq_len,
+    }
+
+    def _stream_factory(codec_chunk):
+        def _stream(**kwargs):
+            kwargs["termination_sink"].update(termination)
+            yield codec_chunk, {"is_final": True}
+
+        return _stream
+
+    model = _configure_voice_design_stream(monkeypatch, _stream_factory)
+    list(
+        model.generate_voice_design_streaming(
+            text="hello",
+            instruct="warm voice",
+            language="English",
+        )
+    )
+
+    assert model.last_generation_trace["termination_reason"] == termination_reason
+    assert model.last_generation_trace["hit_eos"] is False
+    assert model.last_generation_trace["hit_max_new_tokens"] is hit_max_new_tokens
+    assert model.last_generation_trace["hit_max_seq_len"] is hit_max_seq_len
+
+
+def test_voice_design_consecutive_requests_replace_previous_trace(monkeypatch):
+    traces = iter(
+        [
+            {
+                "termination_reason": "eos",
+                "terminal_token_id": 2150,
+                "terminal_step_index": 2,
+                "generated_steps": 2,
+                "emitted_steps": 2,
+                "hit_eos": True,
+                "hit_max_new_tokens": False,
+                "hit_max_seq_len": False,
+            },
+            {
+                "termination_reason": "max_new_tokens",
+                "terminal_token_id": None,
+                "terminal_step_index": 5,
+                "generated_steps": 6,
+                "emitted_steps": 6,
+                "hit_eos": False,
+                "hit_max_new_tokens": True,
+                "hit_max_seq_len": False,
+            },
+        ]
+    )
+
+    def _stream_factory(codec_chunk):
+        def _stream(**kwargs):
+            kwargs["termination_sink"].update(next(traces))
+            yield codec_chunk, {"is_final": True}
+
+        return _stream
+
+    model = _configure_voice_design_stream(monkeypatch, _stream_factory)
+    request = {
+        "text": "hello",
+        "instruct": "warm voice",
+        "language": "English",
+    }
+    list(model.generate_voice_design_streaming(**request))
+    first_trace = model.last_generation_trace
+    list(model.generate_voice_design_streaming(**request))
+
+    assert first_trace["termination_reason"] == "eos"
+    assert model.last_generation_trace["termination_reason"] == "max_new_tokens"
+    assert model.last_generation_trace["hit_eos"] is False
+
+
+def test_voice_design_generator_failure_does_not_publish_stale_trace(monkeypatch):
+    def _stream_factory(_codec_chunk):
+        def _stream(**_kwargs):
+            raise RuntimeError("synthetic generator failure")
+            yield  # pragma: no cover
+
+        return _stream
+
+    model = _configure_voice_design_stream(monkeypatch, _stream_factory)
+    model.last_generation_trace = {"stale": True}
+
+    with pytest.raises(RuntimeError, match="synthetic generator failure"):
+        list(
+            model.generate_voice_design_streaming(
+                text="hello",
+                instruct="warm voice",
+                language="English",
+            )
+        )
+
+    assert model.last_generation_trace is None
+
+
+def test_voice_design_trace_disabled_preserves_streaming_output(monkeypatch):
+    def _stream_factory(codec_chunk):
+        def _stream(**_kwargs):
+            yield codec_chunk, {"is_final": True}
+
+        return _stream
+
+    model = _configure_voice_design_stream(
+        monkeypatch,
+        _stream_factory,
+        collect=False,
+    )
+    model.last_generation_trace = {"previous": True}
+
+    chunks = list(
+        model.generate_voice_design_streaming(
+            text="hello",
+            instruct="warm voice",
+            language="English",
+        )
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0][1] == 24000
+    assert model.last_generation_trace == {"previous": True}
 
 
 def test_prepare_generation_uses_precomputed_xvec_prompt_without_prompt_extraction():
